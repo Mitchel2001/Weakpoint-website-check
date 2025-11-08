@@ -22,10 +22,11 @@ import random
 import re
 import socket
 import ssl
-from dataclasses import asdict, dataclass
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urljoin, urlparse
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -68,8 +69,32 @@ BACKUP_PROBES = [
 
 PRIVACY_KEYWORDS = ("privacy", "avg", "gdpr", "gegevensbescherming", "cookie")
 
+COMMON_LOGIN_PATHS = [
+    "/login",
+    "/admin",
+    "/beheer",
+    "/wp-login.php",
+    "/wp-admin",
+    "/user/login",
+    "/auth/login",
+    "/account/login",
+    "/signin",
+    "/dashboard",
+    "/beheer/login",
+    "/cms",
+]
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+
+
+@dataclass
+class PageSnapshot:
+    url: str
+    status_code: int
+    html: str
+    soup: BeautifulSoup
+    headers: Dict[str, str]
 
 
 @dataclass
@@ -95,6 +120,7 @@ class ScanContext:
     soup: BeautifulSoup
     robots_txt: Optional[str]
     sitemap_found: bool
+    pages: List[PageSnapshot] = field(default_factory=list)
 
     @property
     def parsed_url(self):
@@ -109,6 +135,138 @@ def _safe_request(
         return resp
     except Exception:
         return None
+
+
+def _normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/") or "/"
+    normalized = urlunparse((scheme, netloc, path, "", parsed.query, ""))
+    return normalized
+
+
+def _is_html_response(resp: requests.Response) -> bool:
+    content_type = resp.headers.get("Content-Type", "").lower()
+    return "html" in content_type or "xml" in content_type or not content_type
+
+
+def _extract_links(
+    soup: BeautifulSoup, base_url: str, base_host: Optional[str]
+) -> Iterable[str]:
+    links: Set[str] = set()
+    for tag in soup.find_all("a", href=True):
+        href = tag.get("href") or ""
+        href = href.strip()
+        if not href or href.startswith("#"):
+            continue
+        if any(href.lower().startswith(prefix) for prefix in ("mailto:", "javascript:", "tel:", "data:")):
+            continue
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if base_host and parsed.hostname and parsed.hostname.lower() != base_host.lower():
+            continue
+        links.add(_normalize_url(absolute))
+    return links
+
+
+def _snapshot_from_response(resp: requests.Response) -> PageSnapshot:
+    html = resp.text or ""
+    soup = BeautifulSoup(html, "html.parser")
+    headers = {k: v for k, v in resp.headers.items()}
+    return PageSnapshot(
+        url=resp.url,
+        status_code=resp.status_code,
+        html=html,
+        soup=soup,
+        headers=headers,
+    )
+
+
+def _crawl_site(
+    initial: PageSnapshot,
+    *,
+    max_pages: int = 12,
+    max_depth: int = 2,
+) -> List[PageSnapshot]:
+    base_parsed = urlparse(initial.url)
+    base_host = base_parsed.hostname
+    base_root = f"{base_parsed.scheme}://{base_parsed.netloc}"
+
+    snapshots: List[PageSnapshot] = [initial]
+    visited: Set[str] = {_normalize_url(initial.url)}
+    queued: Set[str] = set()
+    queue: deque[Tuple[str, int]] = deque()
+
+    def enqueue(candidate: str, depth: int) -> None:
+        normalized = _normalize_url(candidate)
+        if normalized in visited or normalized in queued:
+            return
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"}:
+            return
+        if parsed.hostname and base_host and parsed.hostname.lower() != base_host.lower():
+            return
+        queued.add(normalized)
+        queue.append((normalized, depth))
+
+    for link in _extract_links(initial.soup, initial.url, base_host):
+        enqueue(link, 1)
+
+    for path in COMMON_LOGIN_PATHS:
+        enqueue(urljoin(base_root, path), 1)
+
+    while queue and len(snapshots) < max_pages:
+        candidate, depth = queue.popleft()
+        queued.discard(candidate)
+        if candidate in visited:
+            continue
+        resp = _safe_request(candidate, allow_redirects=True)
+        visited.add(candidate)
+        if resp is None:
+            continue
+        normalized_final = _normalize_url(resp.url)
+        if normalized_final in visited:
+            continue
+        if resp.status_code >= 500:
+            visited.add(normalized_final)
+            continue
+        if not _is_html_response(resp):
+            visited.add(normalized_final)
+            continue
+        snapshot = _snapshot_from_response(resp)
+        snapshots.append(snapshot)
+        visited.add(normalized_final)
+        if depth < max_depth:
+            for link in _extract_links(snapshot.soup, snapshot.url, base_host):
+                enqueue(link, depth + 1)
+        if len(snapshots) >= max_pages:
+            break
+
+    unique_snapshots: Dict[str, PageSnapshot] = {}
+    for snap in snapshots:
+        key = _normalize_url(snap.url)
+        if key not in unique_snapshots:
+            unique_snapshots[key] = snap
+
+    return list(unique_snapshots.values())
+
+
+def _iter_pages(context: ScanContext) -> List[PageSnapshot]:
+    if context.pages:
+        return context.pages
+    fallback = PageSnapshot(
+        url=context.response.url,
+        status_code=context.response.status_code,
+        html=context.html,
+        soup=context.soup,
+        headers={k: v for k, v in context.response.headers.items()},
+    )
+    return [fallback]
 
 
 def _extract_cookies(resp: requests.Response) -> List[Dict[str, Any]]:
@@ -542,36 +700,57 @@ def _check_http_methods(context: ScanContext) -> CheckResult:
 
 
 def _check_forms(context: ScanContext) -> CheckResult:
-    forms = context.soup.find_all("form")
-    insecure = []
-    for idx, form in enumerate(forms, start=1):
-        method = (form.get("method") or "get").lower()
-        inputs = form.find_all(["input", "textarea"])
-        text_inputs = [
-            field
-            for field in inputs
-            if field.get("type", "text").lower()
-            in ("text", "email", "password", "tel", "number")
-        ]
-        for field in text_inputs:
-            if not field.has_attr("required") and not field.get("pattern"):
+    pages = _iter_pages(context)
+    insecure: List[Dict[str, Any]] = []
+    total_forms = 0
+    pages_with_forms: Set[str] = set()
+
+    for page in pages:
+        forms = page.soup.find_all("form")
+        if not forms:
+            continue
+        pages_with_forms.add(page.url)
+        for idx, form in enumerate(forms, start=1):
+            total_forms += 1
+            method = (form.get("method") or "get").lower()
+            inputs = form.find_all(["input", "textarea"])
+            text_inputs = [
+                field
+                for field in inputs
+                if field.get("type", "text").lower()
+                in ("text", "email", "password", "tel", "number")
+            ]
+            for field in text_inputs:
+                if not field.has_attr("required") and not field.get("pattern"):
+                    insecure.append(
+                        {
+                            "page": page.url,
+                            "form": idx,
+                            "input": field.get("name") or field.get("id"),
+                            "reason": "Geen verplichting/patroon; validering ontbreekt mogelijk server-side.",
+                        }
+                    )
+            if method != "post" and any(
+                inp.get("type", "text").lower() == "password" for inp in text_inputs
+            ):
                 insecure.append(
                     {
+                        "page": page.url,
                         "form": idx,
-                        "input": field.get("name") or field.get("id"),
-                        "reason": "Geen verplichting/patroon; validering ontbreekt mogelijk server-side.",
+                        "reason": "Wachtwoordformulier gebruikt GET i.p.v. POST.",
                     }
                 )
-        if method != "post" and any(inp.get("type") == "password" for inp in text_inputs):
-            insecure.append(
-                {"form": idx, "reason": "Wachtwoordformulier gebruikt GET i.p.v. POST."}
-            )
+
     status = STATUS_PASS if not insecure else STATUS_WARN
-    summary = (
-        "Formulieren ogen gezond."
-        if not insecure
-        else f"{len(insecure)} formulieren vertonen ontbrekende validatie."
-    )
+    if not pages_with_forms:
+        summary = "Geen formulieren aangetroffen tijdens crawling."
+        status = STATUS_INFO
+    elif not insecure:
+        summary = f"{total_forms} formulieren gevonden; basisvalidatie lijkt aanwezig."
+    else:
+        summary = (
+            f"{len(insecure)} formulierproblemen gevonden op {len(pages_with_forms)} pagina's."
+        )
     remediation = "Valideer server-side, markeer verplichte velden en gebruik POST voor gevoelige data."
     return _build_result(
         id="forms",
@@ -580,30 +759,46 @@ def _check_forms(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
-        details={"issues": insecure[:10]},
+        details={
+            "total_forms": total_forms,
+            "pages_with_forms": sorted(pages_with_forms)[:10],
+            "issues": insecure[:15],
+        },
     )
 
 
 def _check_xss(context: ScanContext) -> CheckResult:
-    html = context.html
-    inline_handlers = re.findall(r"on\w+=", html, flags=re.IGNORECASE)
-    reflections = []
-    parsed = urlparse(context.response.url)
-    for key, value in parse_qsl(parsed.query):
-        if value and value in html:
-            reflections.append({"param": key, "value": value})
-    inline_scripts = [
-        script
-        for script in context.soup.find_all("script")
-        if not script.get("src") and script.string and "innerHTML" in script.string
-    ]
-    suspicious = bool(inline_handlers or reflections or inline_scripts)
+    pages = _iter_pages(context)
+    suspicious_pages: List[Dict[str, Any]] = []
+
+    for page in pages:
+        inline_handlers = re.findall(r"on\w+=", page.html, flags=re.IGNORECASE)
+        reflections = []
+        parsed = urlparse(page.url)
+        for key, value in parse_qsl(parsed.query):
+            if value and value in page.html:
+                reflections.append({"param": key, "value": value})
+        inline_scripts = [
+            script
+            for script in page.soup.find_all("script")
+            if not script.get("src") and script.string and "innerHTML" in script.string
+        ]
+        if inline_handlers or reflections or inline_scripts:
+            suspicious_pages.append(
+                {
+                    "page": page.url,
+                    "inline_event_handlers": len(inline_handlers),
+                    "reflections": reflections[:5],
+                    "inline_scripts": len(inline_scripts),
+                }
+            )
+
+    suspicious = bool(suspicious_pages)
     status = STATUS_WARN if suspicious else STATUS_INFO
-    summary = (
-        "Inline event handlers of reflecties kunnen XSS mogelijk maken."
-        if suspicious
-        else "Geen directe aanwijzingen voor reflectieve XSS."
-    )
+    if suspicious:
+        summary = f"Inline handlers of reflecties op {len(suspicious_pages)} pagina's."
+    else:
+        summary = "Geen directe aanwijzingen voor reflectieve XSS."
     remediation = "Escape user input, gebruik CSP en vermijd inline event handlers."
     return _build_result(
         id="xss",
@@ -612,16 +807,12 @@ def _check_xss(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
-        details={
-            "inline_event_handlers": len(inline_handlers),
-            "reflections": reflections[:5],
-            "inline_scripts": len(inline_scripts),
-        },
+        details={"pages": suspicious_pages[:10]},
     )
 
 
 def _check_sql_errors(context: ScanContext) -> CheckResult:
-    html = context.html.lower()
+    pages = _iter_pages(context)
     patterns = [
         "sql syntax",
         "mysql_fetch",
@@ -631,13 +822,18 @@ def _check_sql_errors(context: ScanContext) -> CheckResult:
         "pg::",
         "fatal error",
     ]
-    hits = [pattern for pattern in patterns if pattern in html]
+    hits: List[Dict[str, Any]] = []
+    for page in pages:
+        html = page.html.lower()
+        found = sorted({pattern for pattern in patterns if pattern in html})
+        if found:
+            hits.append({"page": page.url, "patterns": found})
+
     status = STATUS_FAIL if hits else STATUS_INFO
-    summary = (
-        "Database foutmeldingen zichtbaar voor bezoekers."
-        if hits
-        else "Geen DB foutmeldingen gevonden in response."
-    )
+    if hits:
+        summary = f"Database foutmeldingen zichtbaar op {len(hits)} pagina's."
+    else:
+        summary = "Geen DB foutmeldingen gevonden in responses."
     remediation = "Zet debug-modes uit en toon generieke fouten; gebruik parameterized queries."
     return _build_result(
         id="sql_injection",
@@ -646,46 +842,82 @@ def _check_sql_errors(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
-        details={"patterns_detected": hits},
+        details={"pages": hits[:10]},
     )
 
 
 def _check_auth_session(context: ScanContext) -> CheckResult:
-    soup = context.soup
-    login_forms = [
-        form
-        for form in soup.find_all("form")
-        if form.find("input", {"type": "password"})
-    ]
-    issues = []
-    for idx, form in enumerate(login_forms, start=1):
-        method = (form.get("method") or "get").lower()
-        if method != "post":
-            issues.append(f"Loginformulier #{idx} gebruikt {method.upper()} i.p.v. POST.")
-        if not form.find("input", {"type": "hidden", "name": re.compile("csrf", re.I)}):
-            issues.append(f"Loginformulier #{idx} lijkt geen CSRF-token te bevatten.")
-    headers = {k.lower(): v for k, v in context.response.headers.items()}
-    rate_headers = [k for k in headers if "ratelimit" in k]
-    if not rate_headers:
+    pages = _iter_pages(context)
+    issues: List[str] = []
+    login_forms_total = 0
+    login_pages: Set[str] = set()
+    detailed_issues: List[Dict[str, Any]] = []
+    rate_headers_found: Set[str] = set()
+    mfa_mentioned = False
+
+    for page in pages:
+        page_headers = {k.lower(): v for k, v in page.headers.items()}
+        for key in page_headers:
+            if "ratelimit" in key or key == "retry-after":
+                rate_headers_found.add(key)
+
+        forms = [
+            form
+            for form in page.soup.find_all("form")
+            if form.find("input", {"type": "password"})
+        ]
+        if forms:
+            login_pages.add(page.url)
+        for idx, form in enumerate(forms, start=1):
+            login_forms_total += 1
+            method = (form.get("method") or "get").lower()
+            if method != "post":
+                msg = f"Loginformulier gebruikt {method.upper()} i.p.v. POST."
+                detailed_issues.append({"page": page.url, "form": idx, "issue": msg})
+            token = form.find("input", {"type": "hidden", "name": re.compile("csrf", re.I)})
+            if not token:
+                detailed_issues.append(
+                    {
+                        "page": page.url,
+                        "form": idx,
+                        "issue": "Geen CSRF-token aangetroffen in formulier.",
+                    }
+                )
+
+        text = page.soup.get_text(" ", strip=True).lower()
+        if any(term in text for term in ("mfa", "twee-factor", "2fa")):
+            mfa_mentioned = True
+
+    if not rate_headers_found:
         issues.append("Geen rate-limit headers aangetroffen; beperk aanmeldpogingen.")
-    text = soup.get_text(" ", strip=True).lower()
-    if login_forms and not any(term in text for term in ("mfa", "twee-factor", "2fa")):
-        issues.append("Geen mention van MFA/twee-factor authenticatie.")
-    status = STATUS_WARN if issues else STATUS_PASS
-    summary = (
-        "; ".join(issues)
-        if issues
-        else "Login-flow gebruikt POST en lijkt CSRF/rate-limit te ondersteunen."
-    )
-    remediation = "Forceer POST, voeg CSRF-tokens toe, implementeer rate limiting en bied MFA aan."
+    if login_forms_total and not mfa_mentioned:
+        issues.append("Geen verwijzing naar MFA/twee-factor authenticatie gevonden.")
+    if detailed_issues:
+        issues.extend(sorted({item["issue"] for item in detailed_issues}))
+
+    if login_forms_total == 0:
+        status = STATUS_INFO
+        summary = "Geen loginformulieren gevonden tijdens crawling."
+    elif not issues:
+        status = STATUS_PASS
+        summary = "Loginflows gebruiken POST, hebben CSRF en benoemen MFA/rate limiting."
+    else:
+        status = STATUS_WARN
+        summary = f"{len(issues)} aandachtspunten rond login/sessie beveiliging."
+
     return _build_result(
         id="auth",
         title="Authenticatie & sessiebeheer",
         severity=SEVERITY_IMPORTANT,
         status=status,
         summary=summary,
-        remediation="Versterk login-, reset- en MFA-processen.",
-        details={"login_forms": len(login_forms), "issues": issues},
+        remediation="Forceer POST, voeg CSRF-tokens toe, implementeer rate limiting en bied MFA aan.",
+        details={
+            "login_forms": login_forms_total,
+            "login_pages": sorted(login_pages)[:10],
+            "issues": detailed_issues[:15],
+            "rate_limit_headers": sorted(rate_headers_found),
+        },
     )
 
 
@@ -751,16 +983,18 @@ def _check_backup_files(context: ScanContext) -> CheckResult:
 
 
 def _check_rate_limiting(context: ScanContext) -> CheckResult:
-    headers = {k.lower(): v for k, v in context.response.headers.items()}
-    rate_limit_headers = {
-        key: value
-        for key, value in headers.items()
-        if "ratelimit" in key or "retry-after" in key
-    }
-    status = STATUS_INFO if rate_limit_headers else STATUS_WARN
+    pages = _iter_pages(context)
+    aggregated: Dict[str, str] = {}
+    for page in pages:
+        for key, value in page.headers.items():
+            lower = key.lower()
+            if "ratelimit" in lower or lower == "retry-after":
+                aggregated[lower] = value
+
+    status = STATUS_INFO if aggregated else STATUS_WARN
     summary = (
-        "Rate-limit headers aanwezig."
-        if rate_limit_headers
+        "Rate-limit headers aangetroffen op responses."
+        if aggregated
         else "Geen rate-limit headers; implementeer throttling voor API/login."
     )
     remediation = "Expose X-RateLimit headers en voer server-side throttling in."
@@ -771,7 +1005,7 @@ def _check_rate_limiting(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
-        details={"headers": rate_limit_headers},
+        details={"headers": aggregated},
     )
 
 
@@ -982,14 +1216,19 @@ def _check_third_party(context: ScanContext) -> CheckResult:
 
 
 def _check_privacy(context: ScanContext) -> CheckResult:
-    text = context.html.lower()
-    keywords_found = [word for word in PRIVACY_KEYWORDS if word in text]
-    status = STATUS_PASS if keywords_found else STATUS_WARN
-    summary = (
-        "Privacy/cookie informatie lijkt aanwezig."
-        if keywords_found
-        else "Geen verwijzing naar privacy/cookiebeleid gevonden."
-    )
+    pages = _iter_pages(context)
+    keyword_map: Dict[str, List[str]] = {}
+    for page in pages:
+        text = page.html.lower()
+        found = sorted({word for word in PRIVACY_KEYWORDS if word in text})
+        if found:
+            keyword_map[page.url] = found
+
+    status = STATUS_PASS if keyword_map else STATUS_WARN
+    if keyword_map:
+        summary = f"Privacy/cookie informatie aangetroffen op {len(keyword_map)} pagina's."
+    else:
+        summary = "Geen verwijzing naar privacy/cookiebeleid gevonden."
     remediation = "Link duidelijk naar privacy- en cookiebeleid en implementeer consentbanner."
     return _build_result(
         id="privacy",
@@ -998,7 +1237,7 @@ def _check_privacy(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
-        details={"keywords_found": keywords_found},
+        details={"keywords": keyword_map},
     )
 
 
@@ -1161,6 +1400,15 @@ def run_scan(target_url: str) -> Dict[str, Any]:
     sitemap_resp = _safe_request(urljoin(base, "/sitemap.xml"), method="HEAD", timeout=6)
     sitemap_found = bool(sitemap_resp and sitemap_resp.status_code < 400)
 
+    initial_page = PageSnapshot(
+        url=resp.url,
+        status_code=resp.status_code,
+        html=html,
+        soup=soup,
+        headers={k: v for k, v in resp.headers.items()},
+    )
+    crawled_pages = _crawl_site(initial_page, max_pages=16, max_depth=2)
+
     context = ScanContext(
         target_url=target_url,
         response=resp,
@@ -1168,6 +1416,7 @@ def run_scan(target_url: str) -> Dict[str, Any]:
         soup=soup,
         robots_txt=robots_txt,
         sitemap_found=sitemap_found,
+        pages=crawled_pages,
     )
 
     critical_results = [check(context) for check in CRITICAL_CHECKS]
@@ -1182,6 +1431,12 @@ def run_scan(target_url: str) -> Dict[str, Any]:
         }
     )
 
+    login_like_pages = [
+        page.url
+        for page in crawled_pages
+        if any(marker in urlparse(page.url).path.lower() for marker in ("login", "admin", "signin", "cms"))
+    ]
+
     return {
         "meta": {
             "target": target_url,
@@ -1191,6 +1446,9 @@ def run_scan(target_url: str) -> Dict[str, Any]:
             "history": [r.status_code for r in resp.history],
             "sitemap_found": sitemap_found,
             "robots_present": bool(robots_txt),
+            "pages_scanned": len(crawled_pages),
+            "sample_pages": [page.url for page in crawled_pages[:10]],
+            "login_like_pages": login_like_pages[:10],
         },
         "critical": [result.to_dict() for result in critical_results],
         "important": [result.to_dict() for result in important_results],
