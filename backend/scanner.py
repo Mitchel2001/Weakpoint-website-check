@@ -287,6 +287,81 @@ def _check_security_headers(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_cache_control(context: ScanContext) -> CheckResult:
+    headers = {k.lower(): v for k, v in context.response.headers.items()}
+    cache_control = headers.get("cache-control")
+    pragma = headers.get("pragma")
+    issues = []
+    if not cache_control:
+        issues.append("Cache-Control header ontbreekt op de hoofdpagina.")
+    else:
+        lowered = cache_control.lower()
+        if "no-cache" not in lowered and "no-store" not in lowered:
+            issues.append("Cache-Control ontbreekt no-cache/no-store voor dynamische content.")
+    if pragma and "no-cache" not in pragma.lower():
+        issues.append("Pragma header staat caching toe; verwijder of zet op no-cache.")
+
+    status = STATUS_PASS if not issues else STATUS_WARN
+    summary = (
+        "Cache headers voorkomen opslag van gevoelige inhoud."
+        if not issues
+        else "; ".join(issues)
+    )
+    remediation = (
+        "Stel Cache-Control: no-store, no-cache, must-revalidate in voor gevoelige pagina's."
+    )
+    return _build_result(
+        id="cache_control",
+        title="Cache-Control & privacy",
+        severity=SEVERITY_CRITICAL,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        details={"cache_control": cache_control, "pragma": pragma},
+    )
+
+
+def _check_csp_strength(context: ScanContext) -> CheckResult:
+    csp_header = context.response.headers.get("Content-Security-Policy")
+    if not csp_header:
+        return _build_result(
+            id="csp_quality",
+            title="Content Security Policy kwaliteit",
+            severity=SEVERITY_CRITICAL,
+            status=STATUS_WARN,
+            summary="Geen CSP header gevonden; inline scripts kunnen XSS mogelijk maken.",
+            remediation="Implementeer een CSP met default-src 'self' en beperk externe bronnen.",
+        )
+
+    policy = csp_header.lower()
+    findings = []
+    if "unsafe-inline" in policy:
+        findings.append("'unsafe-inline' staat toe dat inline scripts draaien.")
+    if "unsafe-eval" in policy:
+        findings.append("'unsafe-eval' maakt eval()/new Function mogelijk.")
+    if "http:" in policy:
+        findings.append("CSP staat onversleutelde http-resources toe.")
+    if not re.search(r"default-src\s+[^;]+", policy):
+        findings.append("default-src ontbreekt; browsers vallen terug op alles toestaan.")
+
+    status = STATUS_PASS if not findings else STATUS_WARN
+    summary = (
+        "CSP lijkt streng geconfigureerd."
+        if not findings
+        else "; ".join(findings)
+    )
+    remediation = "Verwijder onveilige directives en beperk bronnen tot 'self' of specifieke hosts."
+    return _build_result(
+        id="csp_quality",
+        title="Content Security Policy kwaliteit",
+        severity=SEVERITY_CRITICAL,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        details={"csp": csp_header, "issues": findings} if findings else {"csp": csp_header},
+    )
+
+
 def _check_mixed_content(context: ScanContext) -> CheckResult:
     parsed = context.parsed_url
     if parsed.scheme != "https":
@@ -424,6 +499,45 @@ def _check_cookies(context: ScanContext) -> CheckResult:
         summary=summary,
         remediation=remediation,
         details={"cookies_tested": len(cookies), "issues": issues},
+    )
+
+
+def _check_http_methods(context: ScanContext) -> CheckResult:
+    parsed = context.parsed_url
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    allow_details: Dict[str, Any] = {}
+    methods_with_risk = []
+
+    options_resp = _safe_request(base, method="OPTIONS", timeout=6, allow_redirects=False)
+    if options_resp is not None:
+        allow = options_resp.headers.get("Allow") or options_resp.headers.get("allow")
+        if allow:
+            verbs = {verb.strip().upper() for verb in allow.split(",")}
+            allow_details["allow_header"] = sorted(verbs)
+            for risky in {"TRACE", "PUT", "DELETE"}:
+                if risky in verbs:
+                    methods_with_risk.append(risky)
+
+    trace_resp = _safe_request(base, method="TRACE", timeout=6, allow_redirects=False)
+    if trace_resp is not None and trace_resp.status_code < 400:
+        methods_with_risk.append("TRACE (direct toegestaan)")
+        allow_details["trace_status"] = trace_resp.status_code
+
+    status = STATUS_PASS if not methods_with_risk else STATUS_WARN
+    summary = (
+        "Onveilige HTTP methodes lijken geblokkeerd."
+        if not methods_with_risk
+        else "Risicovolle methodes toegestaan: " + ", ".join(sorted(set(methods_with_risk)))
+    )
+    remediation = "Blokkeer TRACE/PUT/DELETE voor publieke origin en beperk OPTIONS responses."
+    return _build_result(
+        id="http_methods",
+        title="HTTP methodes & hardening",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        details=allow_details or None,
     )
 
 
@@ -661,6 +775,39 @@ def _check_rate_limiting(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_security_txt(context: ScanContext) -> CheckResult:
+    parsed = context.parsed_url
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    candidates = ["/.well-known/security.txt", "/security.txt"]
+    found: Optional[str] = None
+    status_code: Optional[int] = None
+
+    for candidate in candidates:
+        url = urljoin(base, candidate)
+        resp = _safe_request(url, timeout=6, allow_redirects=True)
+        if resp is not None and resp.status_code < 400 and resp.text:
+            found = candidate
+            status_code = resp.status_code
+            break
+
+    status = STATUS_PASS if found else STATUS_WARN
+    summary = (
+        "security.txt aanwezig voor responsible disclosure."
+        if found
+        else "Geen security.txt gevonden; documenteer meldproces."
+    )
+    remediation = "Publiceer een security.txt onder /.well-known/ met contactinformatie."
+    return _build_result(
+        id="security_txt",
+        title="security.txt responsible disclosure",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        details={"path": found, "status_code": status_code} if found else None,
+    )
+
+
 def _check_error_handling(context: ScanContext) -> CheckResult:
     parsed = context.parsed_url
     probe_path = f"/__weakpoint_probe_{random.randint(1000, 9999)}"
@@ -855,9 +1002,121 @@ def _check_privacy(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_sri(context: ScanContext) -> CheckResult:
+    parsed = context.parsed_url
+    hostname = parsed.hostname or ""
+    external_scripts = []
+    for tag in context.soup.find_all("script"):
+        src = tag.get("src")
+        if not src:
+            continue
+        absolute = urljoin(context.response.url, src)
+        parsed_src = urlparse(absolute)
+        if parsed_src.hostname and parsed_src.hostname != hostname:
+            has_integrity = bool(tag.get("integrity"))
+            if not has_integrity:
+                external_scripts.append(absolute)
+
+    status = STATUS_PASS if not external_scripts else STATUS_WARN
+    summary = (
+        "Externe scripts gebruiken Subresource Integrity."
+        if not external_scripts
+        else f"{len(external_scripts)} externe scripts zonder SRI."
+    )
+    remediation = "Voeg integriteits-hashes toe aan externe scripts of host assets zelf."
+    return _build_result(
+        id="sri",
+        title="Subresource Integrity voor externe scripts",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        details={"scripts": external_scripts[:10]} if external_scripts else None,
+    )
+
+
+def _aggregate_status_counts(items: List[CheckResult]) -> Dict[str, int]:
+    counts = {
+        STATUS_PASS: 0,
+        STATUS_WARN: 0,
+        STATUS_FAIL: 0,
+        STATUS_INFO: 0,
+    }
+    for item in items:
+        if item.status in counts:
+            counts[item.status] += 1
+    counts["total"] = len(items)
+    return counts
+
+
+def _grade_from_percentage(percentage: float) -> Tuple[str, str]:
+    if percentage >= 90:
+        return "A", "Uitstekend"
+    if percentage >= 80:
+        return "B", "Zeer goed"
+    if percentage >= 70:
+        return "C", "Goed"
+    if percentage >= 60:
+        return "D", "Matig"
+    if percentage >= 40:
+        return "E", "Zorgelijk"
+    return "F", "Kritiek"
+
+
+def _calculate_score(groups: Dict[str, List[CheckResult]]) -> Dict[str, Any]:
+    severity_weights = {
+        SEVERITY_CRITICAL: 5,
+        SEVERITY_IMPORTANT: 3,
+        SEVERITY_NICE: 1,
+    }
+    status_multiplier = {
+        STATUS_PASS: 1.0,
+        STATUS_INFO: 0.85,
+        STATUS_WARN: 0.45,
+        STATUS_FAIL: 0.0,
+    }
+
+    section_payload: Dict[str, Any] = {}
+    total_max = 0.0
+    total_score = 0.0
+    all_items: List[CheckResult] = []
+
+    for key, items in groups.items():
+        all_items.extend(items)
+        max_points = sum(severity_weights.get(item.severity, 1) for item in items)
+        achieved = sum(
+            severity_weights.get(item.severity, 1)
+            * status_multiplier.get(item.status, 0.5)
+            for item in items
+        )
+        percentage = 100.0 if max_points == 0 else (achieved / max_points) * 100.0
+        section_payload[key] = {
+            "score": round(achieved, 2),
+            "max_score": round(max_points, 2),
+            "percentage": round(percentage, 1),
+            "status_counts": _aggregate_status_counts(items),
+        }
+        total_max += max_points
+        total_score += achieved
+
+    overall_percentage = 100.0 if total_max == 0 else (total_score / total_max) * 100.0
+    grade, label = _grade_from_percentage(overall_percentage)
+
+    payload = {
+        "overall": int(round(overall_percentage)),
+        "grade": grade,
+        "label": label,
+        "sections": section_payload,
+        "status_counts": _aggregate_status_counts(all_items),
+    }
+    return payload
+
+
 CRITICAL_CHECKS = [
     _check_tls,
     _check_security_headers,
+    _check_csp_strength,
+    _check_cache_control,
     _check_mixed_content,
     _check_redirects_and_canonical,
     _check_cors,
@@ -873,6 +1132,9 @@ IMPORTANT_CHECKS = [
     _check_backup_files,
     _check_rate_limiting,
     _check_error_handling,
+    _check_http_methods,
+    _check_security_txt,
+    _check_sri,
 ]
 
 NICE_CHECKS = [
@@ -908,9 +1170,17 @@ def run_scan(target_url: str) -> Dict[str, Any]:
         sitemap_found=sitemap_found,
     )
 
-    critical_results = [check(context).to_dict() for check in CRITICAL_CHECKS]
-    important_results = [check(context).to_dict() for check in IMPORTANT_CHECKS]
-    nice_results = [check(context).to_dict() for check in NICE_CHECKS]
+    critical_results = [check(context) for check in CRITICAL_CHECKS]
+    important_results = [check(context) for check in IMPORTANT_CHECKS]
+    nice_results = [check(context) for check in NICE_CHECKS]
+
+    score = _calculate_score(
+        {
+            "critical": critical_results,
+            "important": important_results,
+            "nice_to_have": nice_results,
+        }
+    )
 
     return {
         "meta": {
@@ -922,9 +1192,10 @@ def run_scan(target_url: str) -> Dict[str, Any]:
             "sitemap_found": sitemap_found,
             "robots_present": bool(robots_txt),
         },
-        "critical": critical_results,
-        "important": important_results,
-        "nice_to_have": nice_results,
+        "critical": [result.to_dict() for result in critical_results],
+        "important": [result.to_dict() for result in important_results],
+        "nice_to_have": [result.to_dict() for result in nice_results],
+        "score": score,
     }
 
 

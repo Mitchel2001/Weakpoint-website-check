@@ -126,18 +126,124 @@ body {
   word-break: break-word;
 }
 
-.summary-row {
+
+.score-summary {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 0.75rem;
-  margin-top: 1.5rem;
+  gap: 1.75rem;
+  margin-top: 1.75rem;
 }
 
-.summary-chip {
-  border-radius: 0.75rem;
-  background: #f8fafc;
-  padding: 0.9rem 1rem;
-  border: 1px solid rgba(15, 23, 42, 0.05);
+.score-overall {
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.score-circle {
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  background: conic-gradient(#14b8a6 var(--score-value, 0%), rgba(148, 163, 184, 0.2) 0);
+  display: grid;
+  place-items: center;
+  position: relative;
+}
+
+.score-circle-inner {
+  width: 92px;
+  height: 92px;
+  border-radius: 50%;
+  background: #fff;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.05);
+}
+
+.score-number {
+  font-size: 2.2rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.score-suffix {
+  font-size: 0.9rem;
+  color: #64748b;
+}
+
+.score-grade {
+  margin: 0;
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+
+.score-label {
+  margin: 0.25rem 0 0;
+  font-size: 1rem;
+  font-weight: 500;
+}
+
+.score-description {
+  margin: 0.75rem 0 0;
+  max-width: 420px;
+  line-height: 1.4;
+}
+
+.score-distribution {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.score-row {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.score-row-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.score-row-value {
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.score-bar {
+  height: 0.8rem;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(148, 163, 184, 0.25);
+  display: flex;
+}
+
+.score-bar-segment {
+  display: block;
+  height: 100%;
+}
+
+.score-bar-segment.status-pass {
+  background: #14b8a6;
+}
+
+.score-bar-segment.status-warn {
+  background: #f97316;
+}
+
+.score-bar-segment.status-fail {
+  background: #ef4444;
+}
+
+.score-bar-segment.status-info {
+  background: #3b82f6;
+}
+
+.score-row-footer {
+  margin: 0;
+  font-size: 0.85rem;
 }
 
 .history ul {

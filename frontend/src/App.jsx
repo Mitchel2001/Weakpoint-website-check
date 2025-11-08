@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import CheckGroup from './components/CheckGroup.jsx';
+import ScoreSummary from './components/ScoreSummary.jsx';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
@@ -68,9 +69,11 @@ export default function App() {
     return {
       critical: calc(report.critical),
       important: calc(report.important),
-      nice: calc(report.nice_to_have)
+      nice_to_have: calc(report.nice_to_have)
     };
   }, [report]);
+
+  const score = report?.score;
 
   return (
     <div className="app-shell">
@@ -124,25 +127,8 @@ export default function App() {
               </div>
             </div>
           )}
-          {summaryStats && (
-            <div className="summary-row">
-              {SECTIONS.map((section) => {
-                const stats =
-                  section.key === 'critical'
-                    ? summaryStats.critical
-                    : section.key === 'important'
-                      ? summaryStats.important
-                      : summaryStats.nice;
-                return (
-                  <div key={section.key} className="summary-chip">
-                    <p className="label">{section.title}</p>
-                    <p className="value">
-                      {stats.pass}✅ {stats.warn}⚠️ {stats.fail}⛔
-                    </p>
-                  </div>
-                );
-              })}
-            </div>
+          {score && summaryStats && (
+            <ScoreSummary score={score} sections={SECTIONS} sectionStats={summaryStats} />
           )}
         </section>
 
