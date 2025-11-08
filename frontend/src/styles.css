@@ -1,0 +1,274 @@
+:root {
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: #0f172a;
+  background-color: #f4f6fb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #f4f6fb;
+  color: #0f172a;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.hero {
+  background: radial-gradient(circle at top, #4b6bfb, #1e1b4b);
+  color: #fff;
+  padding: 4rem 1.5rem 6rem;
+}
+
+.hero .eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  font-size: 0.8rem;
+  margin-bottom: 0.5rem;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 3.2rem);
+}
+
+.hero .subtitle {
+  max-width: 720px;
+  color: rgba(255, 255, 255, 0.9);
+  line-height: 1.5;
+}
+
+.page {
+  width: min(1200px, 100%);
+  margin: -4rem auto 4rem;
+  padding: 0 1.5rem;
+}
+
+.panel {
+  background: #fff;
+  border-radius: 1rem;
+  padding: 1.75rem;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(15, 23, 42, 0.06);
+}
+
+.scan-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.scan-form label {
+  font-weight: 600;
+}
+
+.input-row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.input-row input {
+  flex: 1;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(15, 23, 42, 0.15);
+  padding: 0.9rem 1.1rem;
+  font-size: 1rem;
+}
+
+.input-row button {
+  border: none;
+  border-radius: 0.75rem;
+  background: #4b6bfb;
+  color: #fff;
+  padding: 0 1.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.input-row button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.input-row button:not(:disabled):hover {
+  background: #3c5cf0;
+}
+
+.error-message {
+  color: #b42318;
+  font-weight: 600;
+}
+
+.meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.label {
+  font-size: 0.85rem;
+  color: #64748b;
+}
+
+.value {
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.summary-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+.summary-chip {
+  border-radius: 0.75rem;
+  background: #f8fafc;
+  padding: 0.9rem 1rem;
+  border: 1px solid rgba(15, 23, 42, 0.05);
+}
+
+.history ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.history li {
+  display: grid;
+  grid-template-columns: 90px 1fr 1fr 120px;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+}
+
+.muted {
+  color: #64748b;
+}
+
+.group-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.result-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+}
+
+.result-card {
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 0.9rem;
+  padding: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  background: #fff;
+}
+
+.result-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.result-card h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.result-card details {
+  background: #f8fafc;
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.result-card pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.85rem;
+  margin: 0.5rem 0 0;
+}
+
+.status-pill {
+  font-size: 0.85rem;
+  padding: 0.2rem 0.75rem;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
+
+.status-pass {
+  border-left: 4px solid #14b8a6;
+}
+
+.status-pass .status-pill {
+  background: rgba(20, 184, 166, 0.15);
+  color: #047857;
+}
+
+.status-warn {
+  border-left: 4px solid #f97316;
+}
+
+.status-warn .status-pill {
+  background: rgba(249, 115, 22, 0.15);
+  color: #c2410c;
+}
+
+.status-fail {
+  border-left: 4px solid #ef4444;
+}
+
+.status-fail .status-pill {
+  background: rgba(239, 68, 68, 0.15);
+  color: #b91c1c;
+}
+
+.status-info {
+  border-left: 4px solid #3b82f6;
+}
+
+.status-info .status-pill {
+  background: rgba(59, 130, 246, 0.15);
+  color: #1d4ed8;
+}
+
+.placeholder {
+  text-align: center;
+  color: #475569;
+}
+
+@media (max-width: 720px) {
+  .history li {
+    grid-template-columns: 1fr;
+  }
+
+  .input-row {
+    flex-direction: column;
+  }
+
+  .result-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "url": "https://barbershopafkir.nl",
+  "timestamp": "2025-11-08T20:13:15.430715Z",
+  "results": {
+    "status_code": 403,
+    "final_url": "https://barbershopafkir.nl/",
+    "security_headers": [
+      {
+        "header": "content-security-policy",
+        "status": "missing",
+        "advice": "Voeg een strikte Content-Security-Policy toe om XSS en resource-injectie te beperken."
+      },
+      {
+        "header": "strict-transport-security",
+        "status": "missing",
+        "advice": "Voeg HSTS toe (Strict-Transport-Security) zodat browsers automatisch HTTPS forceren."
+      },
+      {
+        "header": "x-frame-options",
+        "status": "missing",
+        "advice": "Voeg X-Frame-Options (of frame-ancestors in CSP) toe om clickjacking te voorkomen."
+      },
+      {
+        "header": "x-content-type-options",
+        "status": "missing",
+        "advice": "Stel X-Content-Type-Options: nosniff in om MIME sniffing te voorkomen."
+      },
+      {
+        "header": "referrer-policy",
+        "status": "missing",
+        "advice": "Stel een passende Referrer-Policy in om onnodige referrer data te beperken."
+      },
+      {
+        "header": "permissions-policy",
+        "status": "missing",
+        "advice": "Gebruik Permissions-Policy om browser API's (bijv. geolocation, camera) te limiteren."
+      },
+      {
+        "header": "x-xss-protection",
+        "status": "missing",
+        "advice": "Deze header is verouderd; vertrouw liever op CSP en moderne browser-beveiligingen."
+      },
+      {
+        "header": "server",
+        "status": "present",
+        "value": "Apache/2",
+        "advice": "Consider hiding/obfuscating software version info in Server header."
+      }
+    ],
+    "set_cookies": [],
+    "cookie_issues": [],
+    "tls": {
+      "ok": true,
+      "subject": [
+        [
+          [
+            "commonName",
+            "barbershopafkir.nl"
+          ]
+        ]
+      ],
+      "issuer": [
+        [
+          [
+            "countryName",
+            "US"
+          ]
+        ],
+        [
+          [
+            "organizationName",
+            "Let's Encrypt"
+          ]
+        ],
+        [
+          [
+            "commonName",
+            "E7"
+          ]
+        ]
+      ],
+      "notAfter": "Jan 30 05:21:08 2026 GMT",
+      "expires": 
