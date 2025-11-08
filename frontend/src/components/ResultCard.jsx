@@ -6,7 +6,7 @@ const STATUS_LABELS = {
 };
 
 export default function ResultCard({ item }) {
-  const { title, summary, remediation, status, details } = item;
+  const { title, summary, impact, remediation, status, details } = item;
   return (
     <article className={`result-card status-${status}`}>
       <header>
@@ -14,6 +14,11 @@ export default function ResultCard({ item }) {
         <span className="status-pill">{STATUS_LABELS[status] ?? status}</span>
       </header>
       <p className="summary">{summary}</p>
+      {impact && (
+        <p className="impact">
+          <span>Impact:</span> {impact}
+        </p>
+      )}
       <p className="remediation">
         <span>Advies:</span> {remediation}
       </p>

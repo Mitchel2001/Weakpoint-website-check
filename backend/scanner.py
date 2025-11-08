@@ -105,6 +105,7 @@ class CheckResult:
     status: str
     summary: str
     remediation: str
+    impact: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -297,6 +298,7 @@ def _build_result(
     status: str,
     summary: str,
     remediation: str,
+    impact: Optional[str] = None,
     details: Optional[Dict[str, Any]] = None,
 ) -> CheckResult:
     return CheckResult(
@@ -306,6 +308,7 @@ def _build_result(
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details=details,
     )
 
@@ -320,6 +323,7 @@ def _check_tls(context: ScanContext) -> CheckResult:
             status=STATUS_WARN,
             summary="Site gebruikt geen HTTPS; verkeer kan onderschept worden.",
             remediation="Forceer HTTPS en installeer een geldig certificaat (bijv. Let's Encrypt).",
+            impact="Aanvallers kunnen verkeer meelezen of manipuleren via een man-in-the-middle aanval waardoor inloggegevens of sessies uitlekken.",
         )
 
     host = parsed.hostname
@@ -358,6 +362,7 @@ def _check_tls(context: ScanContext) -> CheckResult:
             status=STATUS_FAIL,
             summary="Certificaat is ongeldig of niet te valideren.",
             remediation="Controleer intermediate ketens en voer een heruitgifte uit.",
+            impact="Browsers vertrouwen de verbinding niet waardoor bezoekers eenvoudig kunnen worden omgeleid naar malafide servers.",
             details=details,
         )
     except Exception as exc:
@@ -369,6 +374,7 @@ def _check_tls(context: ScanContext) -> CheckResult:
             status=STATUS_FAIL,
             summary="TLS-handshake mislukt; controleer serverconfiguratie.",
             remediation="Controleer firewall, certificaatketen en sluit oude protocollen uit.",
+            impact="Wanneer TLS faalt kunnen bezoekers geen veilige verbinding opzetten en is spoofing of downtime mogelijk.",
             details=details,
         )
 
@@ -391,22 +397,28 @@ def _check_tls(context: ScanContext) -> CheckResult:
     status = STATUS_PASS
     summary = "Geldig certificaat en moderne TLS-configuratie aangetroffen."
     remediation = "Blijf certificaten automatisch vernieuwen en schakel zwakke ciphers uit."
+    impact: Optional[str] = (
+        "Verkeer is beschermd tegen afluisteren; misbruik via netwerk-sniffing wordt voorkomen."
+    )
 
     days_remaining = details.get("days_remaining")
     if isinstance(days_remaining, int) and days_remaining < 0:
         status = STATUS_FAIL
         summary = "Certificaat is verlopen."
         remediation = "Vernieuw het certificaat en controleer automatische vernieuwing."
+        impact = "Browsers blokkeren verlopen certificaten waardoor bezoekers eerder malafide varianten accepteren."
     elif isinstance(days_remaining, int) and days_remaining < 30:
         status = STATUS_WARN
         summary = "Certificaat verloopt binnen 30 dagen."
         remediation = "Plan vernieuwing via ACME (Let's Encrypt) of eigen CA."
+        impact = "Zodra het certificaat verloopt zien bezoekers waarschuwingen en kunnen aanvallers MITM-aanvallen forceren."
     if legacy:
         status = STATUS_WARN
         summary = (
             "Server accepteert legacy TLS-versies (" + ", ".join(legacy) + "); schakel ze uit."
         )
         remediation = "Sta alleen TLS1.2+ toe met ECDHE/ECDSA-ciphers."
+        impact = "Legacy TLS-protocollen bevatten bekende zwaktes waardoor downgrade-aanvallen mogelijk zijn."
 
     return _build_result(
         id="tls",
@@ -415,6 +427,7 @@ def _check_tls(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details=details,
     )
 
@@ -432,6 +445,7 @@ def _check_security_headers(context: ScanContext) -> CheckResult:
             status=STATUS_WARN,
             summary="Ontbrekende headers: " + ", ".join(missing),
             remediation="Configureer CSP, HSTS, XFO, Referrer-Policy, Permissions-Policy en X-Content-Type-Options.",
+            impact="Zonder deze headers kunnen aanvallers eenvoudiger clickjacking, XSS of content-sniffing aanvallen uitvoeren.",
             details=details,
         )
     return _build_result(
@@ -441,6 +455,7 @@ def _check_security_headers(context: ScanContext) -> CheckResult:
         status=STATUS_PASS,
         summary="Essentiële beveiligingsheaders zijn aanwezig.",
         remediation="Controleer periodiek of policies up-to-date zijn.",
+        impact="Browsers blokkeren veelvoorkomende aanvalsvectoren dankzij de ingestelde headers.",
         details=details,
     )
 
@@ -468,6 +483,11 @@ def _check_cache_control(context: ScanContext) -> CheckResult:
     remediation = (
         "Stel Cache-Control: no-store, no-cache, must-revalidate in voor gevoelige pagina's."
     )
+    impact = (
+        "Browsers en proxies bewaren geen gevoelige data waardoor sessies moeilijker te kapen zijn."
+        if status == STATUS_PASS
+        else "Zonder strikte cache-directives kunnen derden op gedeelde apparaten sessies of persoonsgegevens terughalen."
+    )
     return _build_result(
         id="cache_control",
         title="Cache-Control & privacy",
@@ -475,6 +495,7 @@ def _check_cache_control(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"cache_control": cache_control, "pragma": pragma},
     )
 
@@ -489,6 +510,7 @@ def _check_csp_strength(context: ScanContext) -> CheckResult:
             status=STATUS_WARN,
             summary="Geen CSP header gevonden; inline scripts kunnen XSS mogelijk maken.",
             remediation="Implementeer een CSP met default-src 'self' en beperk externe bronnen.",
+            impact="Zonder CSP kunnen ingesloten scripts van aanvallers wachtwoorden en sessies buitmaken.",
         )
 
     policy = csp_header.lower()
@@ -509,6 +531,11 @@ def _check_csp_strength(context: ScanContext) -> CheckResult:
         else "; ".join(findings)
     )
     remediation = "Verwijder onveilige directives en beperk bronnen tot 'self' of specifieke hosts."
+    impact = (
+        "De CSP is streng en beperkt scriptinjecties tot vertrouwde bronnen."
+        if not findings
+        else "Een zwakke CSP laat kwaadaardige scripts toe die bezoekers kunnen omleiden of data stelen."
+    )
     return _build_result(
         id="csp_quality",
         title="Content Security Policy kwaliteit",
@@ -516,6 +543,7 @@ def _check_csp_strength(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"csp": csp_header, "issues": findings} if findings else {"csp": csp_header},
     )
 
@@ -530,6 +558,7 @@ def _check_mixed_content(context: ScanContext) -> CheckResult:
             status=STATUS_INFO,
             summary="Pagina draait op HTTP; mixed content niet van toepassing.",
             remediation="Stap over op HTTPS om mixed content te voorkomen.",
+            impact="Omdat alles over HTTP gaat kunnen aanvallers eenvoudig scripts of malware injecteren.",
         )
 
     mixed = []
@@ -548,6 +577,7 @@ def _check_mixed_content(context: ScanContext) -> CheckResult:
             status=STATUS_WARN,
             summary=f"{len(mixed)} HTTP-resources op een HTTPS pagina.",
             remediation="Serve alle assets via HTTPS of gebruik protocol-relatieve URL's.",
+            impact="HTTP-assets laten man-in-the-middle aanvallen toe waarbij hackers content aanpassen of sessies stelen.",
             details={"items": mixed[:25]},
         )
     return _build_result(
@@ -557,6 +587,7 @@ def _check_mixed_content(context: ScanContext) -> CheckResult:
         status=STATUS_PASS,
         summary="Geen mixed-content risico's gevonden.",
         remediation="Blijf CI/CD checks inzetten om HTTP-assets te blokkeren.",
+        impact="Alle assets laden via HTTPS waardoor injectie door netwerk-aanvallers wordt voorkomen.",
     )
 
 
@@ -582,6 +613,11 @@ def _check_redirects_and_canonical(context: ScanContext) -> CheckResult:
     status = STATUS_PASS if not issues else STATUS_WARN
     summary = "Redirect en canonical configuratie ziet er goed uit." if not issues else "; ".join(issues)
     remediation = "Gebruik korte 301-ketens en stel een eenduidige canonical in."
+    impact = (
+        "Stabiele redirectketens voorkomen dat bezoekers op malafide varianten terechtkomen."
+        if status == STATUS_PASS
+        else "Inconsistente redirects maken phishing en SEO-poisoning makkelijker voor aanvallers."
+    )
     return _build_result(
         id="redirects",
         title="Redirects & canonical",
@@ -589,6 +625,7 @@ def _check_redirects_and_canonical(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"redirect_chain": chain, "final_url": context.response.url},
     )
 
@@ -605,6 +642,7 @@ def _check_cors(context: ScanContext) -> CheckResult:
             status=STATUS_FAIL if (acac and acac.lower() == "true") else STATUS_WARN,
             summary="Alle origins mogen API benaderen; risico op data-exfiltratie.",
             remediation="Gebruik specifieke origins of verwijder CORS-header waar niet nodig.",
+            impact="Kwaadaardige websites kunnen requests namens ingelogde gebruikers uitvoeren en gevoelige API-data uitlezen.",
             details={"Access-Control-Allow-Origin": acao, "Access-Control-Allow-Credentials": acac},
         )
     if not acao:
@@ -615,6 +653,7 @@ def _check_cors(context: ScanContext) -> CheckResult:
             status=STATUS_PASS,
             summary="Geen CORS-header aangetroffen (default deny).",
             remediation="Sta alleen origins toe die het nodig hebben; gebruik allowlists.",
+            impact="Requests vanaf onbekende origins worden standaard geweigerd waardoor sessies niet te kapen zijn.",
         )
     return _build_result(
         id="cors",
@@ -623,6 +662,7 @@ def _check_cors(context: ScanContext) -> CheckResult:
         status=STATUS_INFO,
         summary=f"CORS staat {acao} toe; controleer of dit gewenst is.",
         remediation="Synchroniseer Access-Control-Allow-Origin met toegestane clients.",
+        impact="Controleer of de toegestane origin geen malafide site is die sessies kan misbruiken.",
         details={"Access-Control-Allow-Origin": acao, "Access-Control-Allow-Credentials": acac},
     )
 
@@ -649,6 +689,11 @@ def _check_cookies(context: ScanContext) -> CheckResult:
         else "Onveilige cookie-instellingen aangetroffen."
     )
     remediation = "Markeer sessiecookies als Secure, HttpOnly en SameSite=Lax/Strict."
+    impact = (
+        "Beschermde cookie-flags voorkomen dat sessies via XSS of netwerk sniffing worden gestolen."
+        if status == STATUS_PASS
+        else "Ontbrekende cookie-flags maken het voor aanvallers makkelijker om sessies te kapen of mee te lezen."
+    )
     return _build_result(
         id="cookies",
         title="Cookies & sessies",
@@ -656,6 +701,7 @@ def _check_cookies(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"cookies_tested": len(cookies), "issues": issues},
     )
 
@@ -688,6 +734,11 @@ def _check_http_methods(context: ScanContext) -> CheckResult:
         else "Risicovolle methodes toegestaan: " + ", ".join(sorted(set(methods_with_risk)))
     )
     remediation = "Blokkeer TRACE/PUT/DELETE voor publieke origin en beperk OPTIONS responses."
+    impact = (
+        "Aanvallers kunnen geen misbruik maken van verborgen HTTP-methodes om data te stelen of te wijzigen."
+        if status == STATUS_PASS
+        else "Toegestane methodes zoals TRACE/PUT/DELETE kunnen worden misbruikt voor XST-aanvallen of defacement."
+    )
     return _build_result(
         id="http_methods",
         title="HTTP methodes & hardening",
@@ -695,6 +746,7 @@ def _check_http_methods(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details=allow_details or None,
     )
 
@@ -752,6 +804,12 @@ def _check_forms(context: ScanContext) -> CheckResult:
             f"{len(insecure)} formulierproblemen gevonden op {len(pages_with_forms)} pagina's."
         )
     remediation = "Valideer server-side, markeer verplichte velden en gebruik POST voor gevoelige data."
+    if status == STATUS_WARN:
+        impact = "Zwakke validatie laat aanvallers SQL/XSS payloads indienen of wachtwoorden onderscheppen via GET."
+    elif status == STATUS_PASS:
+        impact = "Formulieren beperken misbruik doordat kritieke velden gevalideerd en veilig verzonden worden."
+    else:
+        impact = "Geen formulieren gevonden tijdens deze crawl; het aanvalsoppervlak via invoer is beperkt."
     return _build_result(
         id="forms",
         title="Forms & input validatie",
@@ -759,6 +817,7 @@ def _check_forms(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={
             "total_forms": total_forms,
             "pages_with_forms": sorted(pages_with_forms)[:10],
@@ -797,8 +856,10 @@ def _check_xss(context: ScanContext) -> CheckResult:
     status = STATUS_WARN if suspicious else STATUS_INFO
     if suspicious:
         summary = f"Inline handlers of reflecties op {len(suspicious_pages)} pagina's."
+        impact = "Deze patronen kunnen leiden tot XSS waardoor aanvallers accounts of sessies kapen."
     else:
         summary = "Geen directe aanwijzingen voor reflectieve XSS."
+        impact = "Er zijn geen duidelijke XSS-triggers aangetroffen, waardoor misbruik minder waarschijnlijk is."
     remediation = "Escape user input, gebruik CSP en vermijd inline event handlers."
     return _build_result(
         id="xss",
@@ -807,6 +868,7 @@ def _check_xss(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"pages": suspicious_pages[:10]},
     )
 
@@ -832,8 +894,10 @@ def _check_sql_errors(context: ScanContext) -> CheckResult:
     status = STATUS_FAIL if hits else STATUS_INFO
     if hits:
         summary = f"Database foutmeldingen zichtbaar op {len(hits)} pagina's."
+        impact = "Gedetailleerde fouten verraden tabelnamen of queries die aanvallers kunnen gebruiken voor SQL-injectie."
     else:
         summary = "Geen DB foutmeldingen gevonden in responses."
+        impact = "De applicatie lekt geen databasefouten waardoor misbruik lastiger is."
     remediation = "Zet debug-modes uit en toon generieke fouten; gebruik parameterized queries."
     return _build_result(
         id="sql_injection",
@@ -842,6 +906,7 @@ def _check_sql_errors(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"pages": hits[:10]},
     )
 
@@ -898,12 +963,15 @@ def _check_auth_session(context: ScanContext) -> CheckResult:
     if login_forms_total == 0:
         status = STATUS_INFO
         summary = "Geen loginformulieren gevonden tijdens crawling."
+        impact = "Er is geen loginoppervlak ontdekt in de gecrawlde pages, dus brute-force risico is laag."
     elif not issues:
         status = STATUS_PASS
         summary = "Loginflows gebruiken POST, hebben CSRF en benoemen MFA/rate limiting."
+        impact = "Beschermde loginflows beperken brute force en sessiekaping door aanvallers."
     else:
         status = STATUS_WARN
         summary = f"{len(issues)} aandachtspunten rond login/sessie beveiliging."
+        impact = "Ontbrekende CSRF/MFA of rate limiting laat aanvallers wachtwoorden uitproberen of sessies overnemen."
 
     return _build_result(
         id="auth",
@@ -912,6 +980,7 @@ def _check_auth_session(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation="Forceer POST, voeg CSRF-tokens toe, implementeer rate limiting en bied MFA aan.",
+        impact=impact,
         details={
             "login_forms": login_forms_total,
             "login_pages": sorted(login_pages)[:10],
@@ -942,6 +1011,11 @@ def _check_server_versions(context: ScanContext) -> CheckResult:
         else "Geen evidente legacy serverversies gedetecteerd."
     )
     remediation = "Werk webserver/frameworks bij en verberg versienummers."
+    impact = (
+        "Bekende kwetsbaarheden in deze versies kunnen direct worden misbruikt voor RCE of informatielekken."
+        if status == STATUS_WARN
+        else "Er worden geen gevoelige versies blootgegeven waardoor fingerprinting minder oplevert."
+    )
     return _build_result(
         id="server_banner",
         title="Outdated software / server info",
@@ -949,6 +1023,7 @@ def _check_server_versions(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"server_header": banner},
     )
 
@@ -971,6 +1046,11 @@ def _check_backup_files(context: ScanContext) -> CheckResult:
         else "Geen bekende backup/config bestanden publiek benaderbaar."
     )
     remediation = "Verplaats gevoelige bestanden buiten webroot of beperk via ACL."
+    impact = (
+        "Deze bestanden bevatten vaak wachtwoorden of database dumps die directe toegang geven aan aanvallers."
+        if status == STATUS_FAIL
+        else "Back-upbestanden zijn afgeschermd waardoor gevoelige configuraties niet uitlekken."
+    )
     return _build_result(
         id="backup_files",
         title="Backup/sensitive files",
@@ -978,6 +1058,7 @@ def _check_backup_files(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"exposed": exposed},
     )
 
@@ -998,6 +1079,11 @@ def _check_rate_limiting(context: ScanContext) -> CheckResult:
         else "Geen rate-limit headers; implementeer throttling voor API/login."
     )
     remediation = "Expose X-RateLimit headers en voer server-side throttling in."
+    impact = (
+        "Zonder rate limiting kunnen brute-force en DoS aanvallen ongestoord doorgaan."
+        if status == STATUS_WARN
+        else "Aanwezige rate-limit signalen helpen misbruik snel af te remmen."
+    )
     return _build_result(
         id="rate_limiting",
         title="Rate limiting / DoS",
@@ -1005,6 +1091,7 @@ def _check_rate_limiting(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"headers": aggregated},
     )
 
@@ -1031,6 +1118,11 @@ def _check_security_txt(context: ScanContext) -> CheckResult:
         else "Geen security.txt gevonden; documenteer meldproces."
     )
     remediation = "Publiceer een security.txt onder /.well-known/ met contactinformatie."
+    impact = (
+        "Onderzoekers weten direct waar ze kwetsbaarheden veilig kunnen melden, waardoor zero-days minder snel op straat belanden."
+        if status == STATUS_PASS
+        else "Zonder disclosure-proces melden onderzoekers kwetsbaarheden mogelijk niet of publiceren ze ze publiek."
+    )
     return _build_result(
         id="security_txt",
         title="security.txt responsible disclosure",
@@ -1038,6 +1130,7 @@ def _check_security_txt(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"path": found, "status_code": status_code} if found else None,
     )
 
@@ -1063,6 +1156,11 @@ def _check_error_handling(context: ScanContext) -> CheckResult:
         else "Geen verbose errors aangetroffen."
     )
     remediation = "Toon generieke 4xx/5xx pagina's en log details server-side."
+    impact = (
+        "Uitgebreide foutmeldingen geven aanvallers stack traces en paden prijs voor verdere exploitatie."
+        if status == STATUS_WARN
+        else "Doordat er geen technische details uitlekken, hebben aanvallers minder aanknopingspunten."
+    )
     return _build_result(
         id="error_handling",
         title="Error handling",
@@ -1070,6 +1168,7 @@ def _check_error_handling(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"sample": snippet},
     )
 
@@ -1088,6 +1187,11 @@ def _check_performance(context: ScanContext) -> CheckResult:
         issues.append(f"Documentgrootte {body_size / 1024:.0f} KiB")
     summary = "Prima laadtijd en paginagrootte." if not issues else ", ".join(issues)
     remediation = "Optimaliseer caching, comprimeer assets en laad scripts async/defer."
+    impact = (
+        "Goede performance houdt de site responsief en verkleint het DoS-aanvalsoppervlak."
+        if status == STATUS_PASS
+        else "Trage pagina's vergroten de kans op timeouts en maken het makkelijker om DoS-aanvallen te laten slagen."
+    )
     return _build_result(
         id="performance",
         title="Performance / Core Web Vitals (indicatief)",
@@ -1095,6 +1199,7 @@ def _check_performance(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"ttfb": ttfb, "body_bytes": body_size, "script_count": script_count},
     )
 
@@ -1120,6 +1225,11 @@ def _check_accessibility(context: ScanContext) -> CheckResult:
     status = STATUS_PASS if not issues else STATUS_WARN
     summary = "Basis a11y-checks lijken in orde." if not issues else "; ".join(issues)
     remediation = "Voorzie media van alt-teksten en koppel labels aan inputs."
+    impact = (
+        "Een toegankelijke site is bruikbaar voor iedereen en voorkomt klachten of juridische risico's."
+        if status == STATUS_PASS
+        else "Gebrek aan toegankelijkheid kan leiden tot klachten en uitsluiting van gebruikers."
+    )
     return _build_result(
         id="accessibility",
         title="Toegankelijkheid (basis)",
@@ -1127,6 +1237,7 @@ def _check_accessibility(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"images_without_alt": missing_alt[:10], "unlabeled_fields": unlabeled[:10]},
     )
 
@@ -1156,9 +1267,11 @@ def _check_seo(context: ScanContext) -> CheckResult:
     if summary_parts:
         status = STATUS_WARN
         summary = "; ".join(summary_parts)
+        impact = "Ontbrekende SEO-elementen maken het moeilijker om gevonden te worden en kunnen omzet kosten."
     else:
         status = STATUS_PASS
         summary = "Basis SEO metadata aanwezig."
+        impact = "Basis SEO is op orde waardoor bezoekers de site beter terugvinden."
     remediation = "Zorg voor unieke titles/descriptions en publiceer sitemap/robots."
     return _build_result(
         id="seo",
@@ -1167,6 +1280,7 @@ def _check_seo(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details=details,
     )
 
@@ -1176,6 +1290,11 @@ def _check_mobile(context: ScanContext) -> CheckResult:
     status = STATUS_PASS if viewport else STATUS_WARN
     summary = "Responsive viewport meta aanwezig." if viewport else "Geen meta viewport -> slechte mobile ervaring."
     remediation = "Gebruik <meta name='viewport' content='width=device-width, initial-scale=1'>."
+    impact = (
+        "Mobiele gebruikers krijgen een optimale ervaring, wat conversieproblemen voorkomt."
+        if status == STATUS_PASS
+        else "Zonder viewport schalen pagina's slecht waardoor gebruikers afhaken."
+    )
     return _build_result(
         id="mobile",
         title="Mobile responsiveness",
@@ -1183,6 +1302,7 @@ def _check_mobile(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
     )
 
 
@@ -1204,6 +1324,11 @@ def _check_third_party(context: ScanContext) -> CheckResult:
         else "Geen externe scripts aangetroffen."
     )
     remediation = "Houd derde partijen beperkt en laad ze async met consent."
+    impact = (
+        "Elke externe scriptbron vormt een supply-chain risico en kan bezoekers volgen."
+        if status == STATUS_INFO
+        else "Door scripts zelf te hosten is het risico op supply-chain injecties minimaal."
+    )
     return _build_result(
         id="third_party",
         title="Third-party scripts / privacy",
@@ -1211,6 +1336,7 @@ def _check_third_party(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"third_party_hosts": unique_hosts},
     )
 
@@ -1227,8 +1353,10 @@ def _check_privacy(context: ScanContext) -> CheckResult:
     status = STATUS_PASS if keyword_map else STATUS_WARN
     if keyword_map:
         summary = f"Privacy/cookie informatie aangetroffen op {len(keyword_map)} pagina's."
+        impact = "Bezoekers vinden het privacybeleid en kunnen toestemming geven volgens AVG."
     else:
         summary = "Geen verwijzing naar privacy/cookiebeleid gevonden."
+        impact = "Zonder zichtbaar beleid voldoet de site mogelijk niet aan AVG en ontbreekt transparantie."
     remediation = "Link duidelijk naar privacy- en cookiebeleid en implementeer consentbanner."
     return _build_result(
         id="privacy",
@@ -1237,6 +1365,7 @@ def _check_privacy(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"keywords": keyword_map},
     )
 
@@ -1263,6 +1392,11 @@ def _check_sri(context: ScanContext) -> CheckResult:
         else f"{len(external_scripts)} externe scripts zonder SRI."
     )
     remediation = "Voeg integriteits-hashes toe aan externe scripts of host assets zelf."
+    impact = (
+        "Integriteitshashes voorkomen dat gemanipuleerde CDN-bestanden bezoekers infecteren."
+        if status == STATUS_PASS
+        else "Zonder SRI kunnen aanvallers externe scripts vervangen en eigen code uitvoeren."
+    )
     return _build_result(
         id="sri",
         title="Subresource Integrity voor externe scripts",
@@ -1270,6 +1404,7 @@ def _check_sri(context: ScanContext) -> CheckResult:
         status=status,
         summary=summary,
         remediation=remediation,
+        impact=impact,
         details={"scripts": external_scripts[:10]} if external_scripts else None,
     )
 

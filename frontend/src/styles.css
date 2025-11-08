@@ -314,6 +314,18 @@ body {
   font-size: 0.85rem;
   margin: 0.5rem 0 0;
 }
+.result-card .summary,
+.result-card .impact,
+.result-card .remediation {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.result-card .impact span,
+.result-card .remediation span {
+  font-weight: 600;
+  color: #0f172a;
+}
 
 .status-pill {
   font-size: 0.85rem;
