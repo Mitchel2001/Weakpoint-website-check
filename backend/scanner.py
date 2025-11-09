@@ -143,6 +143,20 @@ BACKUP_PROBES = [
     "/.env",
 ]
 
+SUPPLY_CHAIN_PATHS = [
+    "/package.json",
+    "/package-lock.json",
+    "/yarn.lock",
+    "/pnpm-lock.yaml",
+    "/composer.json",
+    "/composer.lock",
+    "/Gemfile.lock",
+    "/requirements.txt",
+    "/poetry.lock",
+    "/Pipfile",
+    "/Pipfile.lock",
+]
+
 PRIVACY_KEYWORDS = ("privacy", "avg", "gdpr", "gegevensbescherming", "cookie")
 
 COMMON_LOGIN_PATHS = [
@@ -165,6 +179,56 @@ DIRECTORY_LISTING_MARKERS = [
     "directory listing",
     "parent directory",
 ]
+
+SUBDOMAIN_GUESSES = [
+    "www",
+    "admin",
+    "beheer",
+    "portal",
+    "intranet",
+    "api",
+    "app",
+    "beta",
+    "dev",
+    "test",
+    "staging",
+    "stage",
+    "dashboard",
+    "secure",
+    "vpn",
+    "mail",
+]
+
+SUBDOMAIN_DISCOVERY_LIMIT = 12
+
+PORT_PROBES = {
+    21: "FTP",
+    22: "SSH",
+    25: "SMTP",
+    80: "HTTP",
+    110: "POP3",
+    143: "IMAP",
+    443: "HTTPS",
+    445: "SMB",
+    465: "SMTPS",
+    587: "SMTP Submission",
+    993: "IMAPS",
+    995: "POP3S",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    6379: "Redis",
+    8080: "HTTP-alt",
+    8443: "HTTPS-alt",
+}
+
+LEGACY_PORTS = {21, 23, 25, 110, 143, 445, 3389}
+
+IDOR_TEST_LIMIT = 6
+
+API_CANDIDATE_LIMIT = 12
+
+FILE_UPLOAD_FLAG_FIELDS = ("accept", "capture", "data-max-size", "data-allowed")
 
 JS_LIBRARY_BASELINES: Dict[str, Tuple[int, ...]] = {
     "jquery": (3, 6, 0),
@@ -377,6 +441,25 @@ def _hosts_match(base_host: Optional[str], candidate_host: Optional[str]) -> boo
     if candidate == base:
         return True
     return candidate.endswith(f".{base}")
+
+
+def _resolve_host_ips(host: str) -> List[str]:
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return []
+    except Exception:
+        return []
+    ips = {info[4][0] for info in infos if info and info[4]}
+    return sorted(ips)
+
+
+def _port_is_open(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 
 class HeadlessResponse:
@@ -959,6 +1042,92 @@ def _check_tls(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_dns_surface(context: ScanContext) -> CheckResult:
+    parsed = context.parsed_url
+    hostname = parsed.hostname
+    normalized = _normalize_hostname(hostname)
+    if not hostname or not normalized:
+        return _build_result(
+            id="dns_surface",
+            title="DNS & netwerkoppervlakte",
+            severity=SEVERITY_CRITICAL,
+            status=STATUS_INFO,
+            summary="Doelhost kon niet worden geïnterpreteerd voor DNS-analyse.",
+            remediation="Controleer of de opgegeven URL een geldig hostname bevat.",
+            impact="Zonder hostname kan geen netwerkoppervlak worden bepaald.",
+        )
+
+    discovered: List[Dict[str, Any]] = []
+    seen_hosts: Set[str] = set()
+    for guess in SUBDOMAIN_GUESSES:
+        if len(discovered) >= SUBDOMAIN_DISCOVERY_LIMIT:
+            break
+        candidate = f"{guess}.{normalized}"
+        if candidate in seen_hosts or _normalize_hostname(candidate) == normalized:
+            continue
+        ips = _resolve_host_ips(candidate)
+        if not ips:
+            continue
+        seen_hosts.add(candidate)
+        statuses: Dict[str, int] = {}
+        for scheme in ("https", "http"):
+            url = f"{scheme}://{candidate}"
+            resp = _safe_request(url, method="HEAD", timeout=4, allow_redirects=True)
+            if resp is None or resp.status_code >= 400:
+                resp = _safe_request(url, timeout=4, allow_redirects=True)
+            if resp is not None:
+                statuses[scheme] = resp.status_code
+        discovered.append({"host": candidate, "ips": ips, "statuses": statuses})
+
+    open_ports: List[Dict[str, Any]] = []
+    base_ips = _resolve_host_ips(hostname)
+    for port, service in PORT_PROBES.items():
+        if _port_is_open(hostname, port):
+            open_ports.append(
+                {
+                    "port": port,
+                    "service": service,
+                    "legacy": port in LEGACY_PORTS,
+                }
+            )
+
+    legacy_exposure = any(entry["legacy"] for entry in open_ports)
+    has_extra_subdomains = bool(discovered)
+    has_ports = bool(open_ports)
+
+    if legacy_exposure:
+        status = STATUS_FAIL
+        summary = "Legacy-services of gevoelige poorten publiek bereikbaar."
+    elif has_extra_subdomains or has_ports:
+        status = STATUS_WARN
+        summary = "Aanvullende subdomeinen of open poorten ontdekt."
+    else:
+        status = STATUS_PASS
+        summary = "Geen extra subdomeinen of onverwachte poorten gevonden."
+
+    remediation = "Inventariseer DNS records, sluit overbodige poorten en scherm beheerinterfaces af."
+    impact = (
+        "Extra attack surface (subdomeinen/poorten) kan worden misbruikt om verouderde services aan te vallen."
+        if status in {STATUS_WARN, STATUS_FAIL}
+        else "Beperkt netwerkoppervlak verkleint de kans dat aanvallers zwakke plekken vinden."
+    )
+    details = {
+        "subdomains": discovered,
+        "open_ports": open_ports,
+        "base_ips": base_ips,
+    }
+    return _build_result(
+        id="dns_surface",
+        title="DNS & netwerkoppervlakte",
+        severity=SEVERITY_CRITICAL,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
+    )
+
+
 def _check_security_headers(context: ScanContext) -> CheckResult:
     headers = {k.lower(): v for k, v in context.response.headers.items()}
     missing = [header for header in SECURITY_HEADERS if header not in headers]
@@ -1305,6 +1474,113 @@ def _check_http_methods(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_api_surface(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    base_host = context.parsed_url.hostname
+    candidates: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    def register(url: str, source: str) -> None:
+        if len(candidates) >= API_CANDIDATE_LIMIT:
+            return
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in {"http", "https"}:
+            return
+        if not _hosts_match(base_host, parsed_url.hostname):
+            return
+        normalized = _normalize_url(url)
+        if normalized in seen:
+            return
+        path_lower = parsed_url.path.lower()
+        if not any(
+            indicator in path_lower
+            for indicator in ("/api", "graphql", ".json", "/rest", "/v1", "/v2")
+        ):
+            return
+        seen.add(normalized)
+        candidates.append({"url": url, "source": source})
+
+    for page in pages:
+        for tag in page.soup.find_all(True):
+            for attr in ("href", "src", "data-url", "data-endpoint", "action"):
+                value = tag.get(attr)
+                if not value:
+                    continue
+                register(urljoin(page.url, value), f"{page.url}::{tag.name}[{attr}]")
+        for match in re.findall(r"https?://[^'\"\s>]+", page.html):
+            register(match, f"{page.url}::inline")
+        for match in re.findall(r"['\"](/[^'\"\s>]+)['\"]", page.html):
+            register(urljoin(page.url, match), f"{page.url}::inline")
+
+    tested: List[Dict[str, Any]] = []
+    exposures: List[Dict[str, Any]] = []
+
+    for candidate in candidates:
+        url = candidate["url"]
+        resp = _safe_request(
+            url,
+            timeout=6,
+            allow_redirects=False,
+            headers={"Accept": "application/json, */*;q=0.1"},
+        )
+        entry: Dict[str, Any] = {
+            "url": url,
+            "source": candidate["source"],
+            "status": resp.status_code if resp else None,
+        }
+        issue_reasons: List[str] = []
+        if resp is not None:
+            content_type = resp.headers.get("Content-Type")
+            if content_type:
+                entry["content_type"] = content_type
+            aco = resp.headers.get("Access-Control-Allow-Origin")
+            if aco:
+                entry["cors"] = aco
+                if aco.strip() == "*":
+                    issue_reasons.append("CORS staat alle origins toe")
+            if resp.status_code < 400 and resp.status_code not in {401, 403}:
+                issue_reasons.append(f"Publiek bereikbaar (status {resp.status_code})")
+            body_sample = (resp.text or "")[:200] if resp and resp.text else None
+            if body_sample and any(keyword in body_sample.lower() for keyword in ("error", "exception", "trace")):
+                entry["body_sample"] = body_sample
+            allow = resp.headers.get("Allow")
+            if allow:
+                entry["allow"] = allow
+                if any(method in allow.upper() for method in ("PUT", "PATCH", "DELETE")):
+                    issue_reasons.append("API ondersteunt muterende methodes zonder auth-signaal")
+        if issue_reasons:
+            exposures.append({**entry, "issues": issue_reasons})
+        tested.append(entry)
+
+    status = STATUS_WARN if exposures else (STATUS_INFO if candidates else STATUS_PASS)
+    if exposures:
+        summary = f"Open API endpoints gevonden ({len(exposures)})."
+    elif candidates:
+        summary = "API-indicatoren gevonden maar geen directe blootstelling vastgesteld."
+    else:
+        summary = "Geen API-eindpunten aangetroffen tijdens heuristische scan."
+
+    remediation = (
+        "Bescherm API's met authenticatie, schema-validatie en rate limiting; beperk CORS tot vertrouwde origins."
+    )
+    impact = (
+        "Publieke API's zonder auth kunnen gevoelige gegevens of beheeracties prijsgeven."
+        if exposures
+        else "Wanneer API's afgeschermd zijn neemt het risico op data-exfiltratie sterk af."
+    )
+    details = {"candidates": candidates, "tested": tested, "issues": exposures}
+    return _build_result(
+        id="api_surface",
+        title="API oppervlakte",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
+    )
+
+
 def _check_forms(context: ScanContext) -> CheckResult:
     pages = _iter_pages(context)
     insecure: List[Dict[str, Any]] = []
@@ -1432,6 +1708,111 @@ def _check_forms(context: ScanContext) -> CheckResult:
             "issues": insecure[:15],
             "form_inventory": form_details[:15],
         },
+    )
+
+
+def _check_file_uploads(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    upload_forms: List[Dict[str, Any]] = []
+    issues: List[str] = []
+
+    for page in pages:
+        for idx, form in enumerate(page.soup.find_all("form"), start=1):
+            file_inputs = [
+                field
+                for field in form.find_all("input")
+                if (field.get("type") or "").lower() == "file"
+            ]
+            if not file_inputs:
+                continue
+            method = (form.get("method") or "get").lower()
+            enctype = (form.get("enctype") or "").lower()
+            action = urljoin(page.url, form.get("action") or page.url)
+            has_csrf = any(
+                hidden.get("name")
+                and re.search(r"csrf|token", hidden.get("name"), re.I)
+                for hidden in form.find_all("input", {"type": "hidden"})
+            )
+            field_meta: List[Dict[str, Any]] = []
+            for field in file_inputs:
+                attrs = {
+                    attr: field.get(attr)
+                    for attr in FILE_UPLOAD_FLAG_FIELDS
+                    if field.get(attr)
+                }
+                field_meta.append(
+                    {
+                        "name": field.get("name") or field.get("id"),
+                        "accept": field.get("accept"),
+                        "multiple": field.has_attr("multiple"),
+                        "flags": attrs,
+                    }
+                )
+                if not field.get("accept"):
+                    issues.append(
+                        f"{page.url} formulier #{idx}: file input '{field.get('name')}' zonder accept whitelist."
+                    )
+            if method != "post":
+                issues.append(
+                    f"{page.url} formulier #{idx}: file upload gebruikt {method.upper()} i.p.v. POST."
+                )
+            if "multipart/form-data" not in enctype:
+                issues.append(
+                    f"{page.url} formulier #{idx}: ontbrekende enctype multipart/form-data."
+                )
+            if not has_csrf:
+                issues.append(
+                    f"{page.url} formulier #{idx}: geen CSRF-token zichtbaar bij upload."
+                )
+
+            upload_forms.append(
+                {
+                    "page": page.url,
+                    "form": idx,
+                    "action": action,
+                    "method": method.upper(),
+                    "enctype": enctype or None,
+                    "has_csrf": has_csrf,
+                    "file_fields": field_meta,
+                }
+            )
+
+    if not upload_forms:
+        return _build_result(
+            id="file_uploads",
+            title="File uploads",
+            severity=SEVERITY_IMPORTANT,
+            status=STATUS_PASS,
+            summary="Geen file-upload formulieren gevonden.",
+            remediation="Voeg upload-validatie toe als de applicatie bestanden accepteert.",
+            impact="Zonder uploadoppervlak is het risico op malafide bestanden beperkt.",
+            details=None,
+        )
+
+    status = STATUS_WARN if issues else STATUS_PASS
+    summary = (
+        "Aandachtspunten bij file upload formulieren."
+        if issues
+        else "File uploads tonen basismaatregelen zoals accept-whitelists."
+    )
+    remediation = (
+        "Beperk toegestane bestandstypen, valideer server-side, scan op malware en sla buiten de webroot op."
+    )
+    impact = (
+        "Inadequate uploadbeveiliging kan leiden tot RCE of data-exfiltratie via kwaadaardige bestanden."
+        if issues
+        else "Goede uploadbeveiliging verkleint het risico op webshells en ransomware."
+    )
+    details = {"forms": upload_forms, "issues": issues}
+    return _build_result(
+        id="file_uploads",
+        title="File uploads",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
     )
 
 
@@ -1977,6 +2358,125 @@ def _check_auth_session(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_access_control(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    base_host = context.parsed_url.hostname
+    tested: List[Dict[str, Any]] = []
+    findings: List[str] = []
+    tested_count = 0
+
+    for page in pages:
+        if tested_count >= IDOR_TEST_LIMIT:
+            break
+        parsed_page = urlparse(page.url)
+        if not _hosts_match(base_host, parsed_page.hostname):
+            continue
+        baseline_status = page.status_code
+        baseline_length = len(page.html or "")
+
+        params = parse_qsl(parsed_page.query, keep_blank_values=False)
+        for key, value in params:
+            if tested_count >= IDOR_TEST_LIMIT:
+                break
+            if not value or len(value) < 2:
+                continue
+            if value.isdigit():
+                mutated_value = str(int(value) + 1)
+            else:
+                match = re.search(r"\d+", value)
+                if not match:
+                    continue
+                mutated_value = (
+                    value[: match.start()]
+                    + str(int(match.group()) + 1)
+                    + value[match.end() :]
+                )
+            mutated_url = _replace_query_param(page.url, key, mutated_value)
+            resp = _safe_request(mutated_url, timeout=6, allow_redirects=False)
+            tested_count += 1
+            entry: Dict[str, Any] = {
+                "url": mutated_url,
+                "parameter": key,
+                "original": value,
+                "modified": mutated_value,
+                "status": resp.status_code if resp else None,
+            }
+            if resp is not None:
+                body = resp.text or ""
+                entry["length"] = len(body)
+                if resp.status_code < 400 and (
+                    resp.status_code != baseline_status
+                    or abs(len(body) - baseline_length) > 200
+                ):
+                    entry["suspicious"] = True
+                    findings.append(
+                        f"{page.url} -> parameter '{key}' reageert afwijkend zonder foutmelding"
+                    )
+                if resp.status_code in {401, 403}:
+                    entry["blocked"] = True
+            tested.append(entry)
+
+        segments = parsed_page.path.split("/")
+        for idx, segment in enumerate(segments):
+            if tested_count >= IDOR_TEST_LIMIT:
+                break
+            if not segment or not segment.isdigit() or len(segment) < 2:
+                continue
+            mutated_segments = list(segments)
+            mutated_segments[idx] = str(int(segment) + 1)
+            mutated_path = "/".join(mutated_segments)
+            mutated_parsed = parsed_page._replace(path=mutated_path)
+            mutated_url = urlunparse(mutated_parsed)
+            resp = _safe_request(mutated_url, timeout=6, allow_redirects=False)
+            tested_count += 1
+            entry = {
+                "url": mutated_url,
+                "original_segment": segment,
+                "modified_segment": mutated_segments[idx],
+                "status": resp.status_code if resp else None,
+            }
+            if resp is not None:
+                body = resp.text or ""
+                entry["length"] = len(body)
+                if resp.status_code < 400 and (
+                    resp.status_code != baseline_status
+                    or abs(len(body) - baseline_length) > 200
+                ):
+                    entry["suspicious"] = True
+                    findings.append(
+                        f"{page.url} -> padsegment '{segment}' lijkt manipuleerbaar"
+                    )
+                if resp.status_code in {401, 403}:
+                    entry["blocked"] = True
+            tested.append(entry)
+
+    status = STATUS_WARN if findings else STATUS_PASS
+    summary = (
+        "Mogelijke IDOR/BAC zwaktes gevonden."
+        if findings
+        else "Geen duidelijke IDOR-patronen ontdekt in beperkte heuristiek."
+    )
+    remediation = (
+        "Implementeer server-side autorisatiecontroles per object en gebruik onvoorspelbare referenties."
+    )
+    impact = (
+        "Gebruikers zouden via IDOR andermans data kunnen lezen of wijzigen."
+        if findings
+        else "Autorisatiecontroles lijken parametrische manipulatie te blokkeren."
+    )
+    details = {"tested": tested, "findings": findings}
+    return _build_result(
+        id="access_control",
+        title="Toegangscontrole & IDOR",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
+    )
+
+
 def _check_server_versions(context: ScanContext) -> CheckResult:
     headers = {k.lower(): v for k, v in context.response.headers.items()}
     banner = headers.get("server") or headers.get("x-powered-by")
@@ -2047,6 +2547,52 @@ def _check_backup_files(context: ScanContext) -> CheckResult:
         remediation=remediation,
         impact=impact,
         details={"exposed": exposed},
+    )
+
+
+def _check_supply_chain(context: ScanContext) -> CheckResult:
+    parsed = context.parsed_url
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    exposed: List[Dict[str, Any]] = []
+
+    for path in SUPPLY_CHAIN_PATHS:
+        url = urljoin(base, path)
+        resp = _safe_request(url, timeout=6, allow_redirects=False)
+        if resp is None or resp.status_code >= 400 or not resp.text:
+            continue
+        snippet = resp.text[:200]
+        exposed.append(
+            {
+                "path": path,
+                "status": resp.status_code,
+                "snippet": snippet,
+            }
+        )
+        if len(exposed) >= 10:
+            break
+
+    status = STATUS_FAIL if exposed else STATUS_PASS
+    summary = (
+        "Software supply chain artefacten publiek toegankelijk."
+        if exposed
+        else "Geen dependency manifests publiek gevonden."
+    )
+    remediation = "Voorkom dat package manifests/lockfiles via de webserver uitlekken en publiceer SBOMs gecontroleerd."
+    impact = (
+        "Lekkende lockfiles geven inzicht in kwetsbare bibliotheken en interne structuur, nuttig voor aanvallers."
+        if exposed
+        else "Afgeschermde dependency-informatie beperkt reconnaissance voor supply-chain aanvallen."
+    )
+    details = {"exposed": exposed} if exposed else {"checked_paths": SUPPLY_CHAIN_PATHS[:10]}
+    return _build_result(
+        id="supply_chain",
+        title="Supply chain blootstelling",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
     )
 
 
@@ -2156,6 +2702,82 @@ def _check_outdated_js_libraries(context: ScanContext) -> CheckResult:
         remediation=remediation,
         impact=impact,
         details={"outdated": outdated[:10]} if outdated else None,
+    )
+
+
+def _check_business_logic(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    keywords = {
+        "korting",
+        "discount",
+        "coupon",
+        "voucher",
+        "promo",
+        "tegoed",
+        "credit",
+        "loyalty",
+        "punten",
+        "cadeau",
+        "gift",
+        "refund",
+        "betaal",
+    }
+    flow_indicators: List[Dict[str, Any]] = []
+    risky_inputs: List[Dict[str, Any]] = []
+
+    for page in pages:
+        text = page.soup.get_text(" ", strip=True).lower()
+        hits = sorted({word for word in keywords if word in text})
+        if hits:
+            flow_indicators.append({"page": page.url, "keywords": hits})
+
+        for form in page.soup.find_all("form"):
+            action = urljoin(page.url, form.get("action") or page.url)
+            for field in form.find_all(["input", "select", "button"]):
+                identifier = (field.get("name") or field.get("id") or "").lower()
+                label = field.get("value") or field.get_text(" ", strip=True)
+                label_lower = (label or "").lower()
+                if not identifier and not label_lower:
+                    continue
+                haystack = f"{identifier} {label_lower}".strip()
+                if any(term in haystack for term in ("coupon", "korting", "discount", "voucher", "gift", "admin", "role", "price", "amount")):
+                    risky_inputs.append(
+                        {
+                            "page": page.url,
+                            "action": action,
+                            "field": identifier or label_lower[:40],
+                        }
+                    )
+
+    status = STATUS_WARN if risky_inputs else (STATUS_INFO if flow_indicators else STATUS_PASS)
+    if risky_inputs:
+        summary = f"Business-logic inputs gevonden die misbruikbaar kunnen zijn ({len(risky_inputs)})."
+    elif flow_indicators:
+        summary = "Business-flow triggers gevonden; handmatige review aanbevolen."
+    else:
+        summary = "Geen duidelijke business-logic oppervlakken gevonden."
+
+    remediation = (
+        "Leg kritieke flows vast in testcases, valideer server-side en voorkom dubbele kortingen of privilege-escalatie."
+    )
+    impact = (
+        "Onvoldoende checks op kortings- of rolvelden kunnen leiden tot financieel verlies of ongeautoriseerde toegang."
+        if risky_inputs
+        else "Gedocumenteerde business-logic controles verkleinen misbruik van speciale flows."
+    )
+    details = {
+        "flow_indicators": flow_indicators[:15],
+        "risky_inputs": risky_inputs[:15],
+    }
+    return _build_result(
+        id="business_logic",
+        title="Business-logic heuristiek",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
     )
 
 
@@ -2670,6 +3292,7 @@ def _calculate_score(groups: Dict[str, List[CheckResult]]) -> Dict[str, Any]:
 
 CRITICAL_CHECKS = [
     _check_tls,
+    _check_dns_surface,
     _check_security_headers,
     _check_csp_strength,
     _check_cache_control,
@@ -2681,14 +3304,19 @@ CRITICAL_CHECKS = [
 ]
 
 IMPORTANT_CHECKS = [
+    _check_api_surface,
     _check_xss,
     _check_reflection_probes,
     _check_sql_errors,
     _check_auth_session,
+    _check_access_control,
     _check_server_versions,
     _check_backup_files,
+    _check_supply_chain,
     _check_directory_listing,
     _check_outdated_js_libraries,
+    _check_file_uploads,
+    _check_business_logic,
     _check_rate_limiting,
     _check_error_handling,
     _check_graphql_introspection,
