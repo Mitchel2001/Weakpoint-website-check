@@ -31,7 +31,7 @@ export default function ScoreSummary({ score, sections, sectionStats }) {
           <p className="score-grade">Beveiligingsscore {score.grade}</p>
           <p className="score-label">{score.label}</p>
           <p className="muted score-description">
-            Gebaseerd op {score.status_counts?.total ?? 0} checks verdeeld over kritieke, belangrijke en aanvullende categorieën.
+            Gebaseerd op {score.status_counts?.total ?? 0} checks verdeeld over kritieke, belangrijke, pentest- en aanvullende categorieën.
           </p>
         </div>
       </div>
