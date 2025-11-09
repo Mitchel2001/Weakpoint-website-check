@@ -55,6 +55,19 @@ REFLECTION_PARAM = "__weakpoint_probe"
 HEADLESS_TRIGGER_CODES = {401, 403, 406, 429, 451}
 HEADLESS_ENV_FLAG = os.getenv("WEAKPOINT_HEADLESS", "0") == "1"
 
+SQL_ERROR_PATTERNS = [
+    "sql syntax",
+    "mysql_fetch",
+    "sqlstate",
+    "odbc",
+    "ora-",
+    "pg::",
+    "fatal error",
+]
+
+PENTEST_FORM_LIMIT = 8
+PENTEST_PAYLOAD_TEMPLATE = "\"'><weakpoint-{token}>"
+
 try:
     from playwright.sync_api import sync_playwright
 except Exception:  # pragma: no cover - optional dependency
@@ -1315,19 +1328,10 @@ def _check_reflection_probes(context: ScanContext) -> CheckResult:
 
 def _check_sql_errors(context: ScanContext) -> CheckResult:
     pages = _iter_pages(context)
-    patterns = [
-        "sql syntax",
-        "mysql_fetch",
-        "sqlstate",
-        "odbc",
-        "ora-",
-        "pg::",
-        "fatal error",
-    ]
     hits: List[Dict[str, Any]] = []
     for page in pages:
         html = page.html.lower()
-        found = sorted({pattern for pattern in patterns if pattern in html})
+        found = sorted({pattern for pattern in SQL_ERROR_PATTERNS if pattern in html})
         if found:
             hits.append({"page": page.url, "patterns": found})
 
@@ -1348,6 +1352,165 @@ def _check_sql_errors(context: ScanContext) -> CheckResult:
         remediation=remediation,
         impact=impact,
         details={"pages": hits[:10]},
+    )
+
+
+def _check_active_form_attacks(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    token = f"{random.randint(100000, 999999)}"
+    payload = PENTEST_PAYLOAD_TEMPLATE.format(token=token)
+    reflections: List[Dict[str, Any]] = []
+    sanitized: List[Dict[str, Any]] = []
+    sql_errors: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+    tested = 0
+
+    for page in pages:
+        if tested >= PENTEST_FORM_LIMIT:
+            break
+        forms = page.soup.find_all("form")
+        if not forms:
+            continue
+        for idx, form in enumerate(forms, start=1):
+            if tested >= PENTEST_FORM_LIMIT:
+                break
+            method = (form.get("method") or "get").lower()
+            action = form.get("action") or page.url
+            target = urljoin(page.url, action)
+
+            field_names: List[str] = []
+            for input_tag in form.find_all("input"):
+                name = input_tag.get("name")
+                if not name:
+                    continue
+                input_type = (input_tag.get("type") or "text").lower()
+                if input_type in {"submit", "button", "image", "reset", "file"}:
+                    continue
+                field_names.append(name)
+            for textarea in form.find_all("textarea"):
+                name = textarea.get("name")
+                if name:
+                    field_names.append(name)
+
+            if not field_names:
+                continue
+
+            tested += 1
+            data = {name: payload for name in field_names}
+            if method == "post":
+                resp = _safe_request(target, method="POST", data=data, timeout=DEFAULT_TIMEOUT)
+            else:
+                resp = _safe_request(target, method="GET", params=data, timeout=DEFAULT_TIMEOUT)
+
+            if resp is None:
+                blocked.append(
+                    {
+                        "page": page.url,
+                        "target": target,
+                        "form_index": idx,
+                        "reason": "no-response",
+                    }
+                )
+                continue
+
+            text = resp.text or ""
+            lowered = text.lower()
+            marker = f"weakpoint-{token}".lower()
+            if f"<weakpoint-{token}>" in text:
+                reflections.append(
+                    {
+                        "page": page.url,
+                        "target": target,
+                        "form_index": idx,
+                        "status_code": resp.status_code,
+                    }
+                )
+            elif marker in lowered:
+                if f"&lt;weakpoint-{token}&gt;" in lowered:
+                    sanitized.append(
+                        {
+                            "page": page.url,
+                            "target": target,
+                            "form_index": idx,
+                            "status_code": resp.status_code,
+                        }
+                    )
+
+            hits = sorted({pattern for pattern in SQL_ERROR_PATTERNS if pattern in lowered})
+            if hits:
+                sql_errors.append(
+                    {
+                        "page": page.url,
+                        "target": target,
+                        "form_index": idx,
+                        "status_code": resp.status_code,
+                        "patterns": hits,
+                    }
+                )
+
+            if resp.status_code >= 400:
+                blocked.append(
+                    {
+                        "page": page.url,
+                        "target": target,
+                        "form_index": idx,
+                        "status_code": resp.status_code,
+                    }
+                )
+
+    status = STATUS_PASS
+    summary = "Formulieren filteren actieve payloads of reageren veilig."
+    remediation = "Blijf input valideren en ontsmetten; monitor WAF-logs op afwijkingen."
+    impact = "Aanvallers krijgen geen directe feedback om XSS/SQL-injectie via formulieren te misbruiken."
+
+    if reflections or sql_errors:
+        status = STATUS_FAIL
+        parts = []
+        if reflections:
+            parts.append(
+                f"Payload reflecteert ongesanitized op {len(reflections)} formulier(en)."
+            )
+        if sql_errors:
+            parts.append(
+                f"Databasefouten na injectie op {len(sql_errors)} doel(en)."
+            )
+        summary = " ".join(parts)
+        remediation = (
+            "Valideer en ontsmet invoer server-side, encodeer output en gebruik parameterized queries."
+        )
+        impact = (
+            "Aanvallers kunnen de reflectie gebruiken voor XSS of de foutmeldingen om SQL-injecties te ontwikkelen."
+        )
+    elif blocked:
+        status = STATUS_WARN
+        summary = (
+            f"Actieve payloads werden geblokkeerd of geweigerd ({len(blocked)} keer)."
+        )
+        remediation = (
+            "Controleer of blokkades legitiem zijn en documenteer WAF/rate limit regels."
+        )
+        impact = (
+            "Blokkade wijst op tegenmaatregelen, maar handmatige review blijft nodig om ev. bypasses uit te sluiten."
+        )
+
+    details: Dict[str, Any] = {
+        "tested_forms": tested,
+        "payload": payload,
+        "reflections": reflections[:10],
+        "sanitized": sanitized[:10],
+        "sql_errors": sql_errors[:10],
+        "blocked": blocked[:10],
+    }
+
+    return _build_result(
+        id="active_forms",
+        title="Actieve formulier pentest",
+        severity=SEVERITY_CRITICAL,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
     )
 
 
@@ -1952,6 +2115,10 @@ IMPORTANT_CHECKS = [
     _check_sri,
 ]
 
+PENTEST_CHECKS = [
+    _check_active_form_attacks,
+]
+
 NICE_CHECKS = [
     _check_performance,
     _check_accessibility,
@@ -2025,12 +2192,18 @@ def run_scan(
         {"type": "phase", "phase": "security", "progress": 72},
     )
     important_results = [check(context) for check in IMPORTANT_CHECKS]
+    _notify_progress(
+        progress_callback,
+        {"type": "phase", "phase": "pentest", "progress": 80},
+    )
+    pentest_results = [check(context) for check in PENTEST_CHECKS]
     nice_results = [check(context) for check in NICE_CHECKS]
 
     score = _calculate_score(
         {
             "critical": critical_results,
             "important": important_results,
+            "pentest": pentest_results,
             "nice_to_have": nice_results,
         }
     )
@@ -2063,6 +2236,7 @@ def run_scan(
         },
         "critical": [result.to_dict() for result in critical_results],
         "important": [result.to_dict() for result in important_results],
+        "pentest": [result.to_dict() for result in pentest_results],
         "nice_to_have": [result.to_dict() for result in nice_results],
         "score": score,
     }

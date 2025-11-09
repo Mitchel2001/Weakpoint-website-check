@@ -7,6 +7,7 @@ const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 const SECTIONS = [
   { key: 'critical', title: 'Kritische checks', description: 'Moeten altijd in orde zijn (TLS, headers, cookies, formulieren, redirectgedrag).' },
   { key: 'important', title: 'Belangrijke checks', description: 'Veel voorkomende misconfiguraties met impact op veiligheid of uptime.' },
+  { key: 'pentest', title: 'Actieve pentest', description: 'Veilige formulierinjecties om XSS/SQL-fouten en WAF-reacties te signaleren.' },
   { key: 'nice_to_have', title: 'Nice to have', description: 'UX/SEO/privacy inzichten die het totaalplaatje verbeteren.' }
 ];
 
@@ -15,7 +16,8 @@ const SCAN_PHASES = [
   { id: 'crawl', title: 'Site verkennen', start: 20, description: 'Interne links, robots.txt en sitemap doornemen.' },
   { id: 'forms', title: 'Formulieren & login', start: 45, description: 'Velden zoeken waar invoer binnenkomt.' },
   { id: 'security', title: 'Veiligheidschecks', start: 65, description: 'Headers, TLS, cookies en foutmeldingen scannen.' },
-  { id: 'report', title: 'Rapport samenstellen', start: 85, description: 'Alles netjes bundelen en scores berekenen.' }
+  { id: 'pentest', title: 'Actieve probes', start: 78, description: 'Formulieren testen met veilige payloads.' },
+  { id: 'report', title: 'Rapport samenstellen', start: 88, description: 'Alles netjes bundelen en scores berekenen.' }
 ];
 
 const buildApiUrl = (path) => (API_BASE_URL ? `${API_BASE_URL}${path}` : path);
@@ -182,6 +184,7 @@ export default function App() {
     return {
       critical: calc(report.critical),
       important: calc(report.important),
+      pentest: calc(report.pentest),
       nice_to_have: calc(report.nice_to_have)
     };
   }, [report]);
@@ -197,8 +200,8 @@ export default function App() {
           <p className="eyebrow">WeakPoint</p>
           <h1>Website Security Check</h1>
           <p className="subtitle">
-            Plak een URL, druk op scan en ontvang direct een rapport met kritieke, belangrijke en nice-to-have verbeterpunten.
-            Alle checks zijn niet-intrusief en veilig voor productieomgevingen.
+            Plak een URL, druk op scan en ontvang direct een rapport met kritieke, belangrijke, pentest- en nice-to-have verbeterpunten.
+            Alle checks gebruiken veilige payloads zonder brute-force of destructieve acties.
           </p>
         </div>
       </header>
@@ -309,7 +312,7 @@ export default function App() {
               key={section.key}
               title={section.title}
               description={section.description}
-              items={section.key === 'critical' ? report.critical : section.key === 'important' ? report.important : report.nice_to_have}
+              items={report?.[section.key] ?? []}
             />
           ))
         ) : (

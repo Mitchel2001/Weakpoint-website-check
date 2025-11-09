@@ -1,6 +1,6 @@
 # WeakPoint Website Check
 
-Een modernere opzet voor de oorspronkelijke scanner: een Python-backend (FastAPI) levert de beveiligingsscan als JSON, terwijl een React-frontend gebruikers een nette UI geeft om hun URL te laten controleren. De scanner blijft strikt passief (geen bruteforce of destructieve requests) en groepeert bevindingen in **kritische**, **belangrijke** en **nice-to-have** categorieën.
+Een modernere opzet voor de oorspronkelijke scanner: een Python-backend (FastAPI) levert de beveiligingsscan als JSON, terwijl een React-frontend gebruikers een nette UI geeft om hun URL te laten controleren. De scanner combineert passieve checks met een optionele, lichte **pentest**-module (geen bruteforce of destructieve requests) en groepeert bevindingen in **kritische**, **belangrijke**, **pentest** en **nice-to-have** categorieën.
 
 ```
 Weakpoint-website-check/
@@ -23,6 +23,7 @@ Weakpoint-website-check/
 | --- | --- |
 | Kritisch | TLS/HTTPS (keten, verlopen, legacy protocollen), security headers (CSP/HSTS/XFO/etc.), mixed content, redirect/canonical hygiëne, CORS-configuratie, cookies (Secure/HttpOnly/SameSite), forms/input validatie. |
 | Belangrijk | Inline XSS hints, SQL/command error leakage, authenticatie & sessiebeheer (POST, CSRF, rate limiting, MFA-verwijzing), server banners / verouderde software, publieke backup/config files, rate-limit inzicht, error handling (verbose errors). |
+| Pentest | Actieve formulierinjecties (XSS reflectie, SQL-foutdetectie, WAF-reacties) met veilige payloads. |
 | Nice-to-have | Performance/TTFB + grootte, basis toegankelijkheid, SEO-meta & sitemap, mobile/viewport, third-party scripts, privacy/cookieverwijzingen. |
 
 Alle check-resultaten bevatten een korte samenvatting, impact/status (`pass`, `warn`, `fail`, `info`), remediation-tip en optionele detailpayload (JSON) die de UI kan tonen.
@@ -54,7 +55,7 @@ python -m backend.scanner --url https://example.com --output report.json
 | Methode | Pad | Body | Beschrijving |
 | --- | --- | --- | --- |
 | `GET` | `/healthz` | – | Gezondheidscheck (handig voor k8s/compose). |
-| `POST` | `/api/scan` | `{ "url": "https://voorbeeld.nl" }` | Draait alle checks en retourneert het rapport (`meta`, `critical`, `important`, `nice_to_have`). |
+| `POST` | `/api/scan` | `{ "url": "https://voorbeeld.nl" }` | Draait alle checks en retourneert het rapport (`meta`, `critical`, `important`, `pentest`, `nice_to_have`). |
 
 Voorbeeld responsefragment:
 
@@ -75,9 +76,25 @@ Voorbeeld responsefragment:
       "remediation": "Blijf certificaten automatisch vernieuwen en schakel zwakke ciphers uit.",
       "details": { "tls_version": "TLSv1.3", "days_remaining": 62 }
     }
+  ],
+  "pentest": [
+    {
+      "id": "active_forms",
+      "title": "Actieve formulier pentest",
+      "status": "pass",
+      "summary": "Formulieren filteren actieve payloads of reageren veilig.",
+      "details": { "tested_forms": 3 }
+    }
   ]
 }
 ```
+
+## Pentest-module (actieve checks)
+
+- Test maximaal 8 formulieren met een veilige payload (`"'&lt;weakpoint-…`) om XSS-reflectie of SQL-foutmeldingen uit te lokken.
+- Rapporteert ongesanitized reflecties als **fail**, geblokkeerde requests als **warn** en geslaagde filtering als **pass**.
+- Produceert geen brute-force verkeer en gebruikt standaard timeouts/headers van de passieve scanner.
+- De payload en doel-URL's van de actieve requests worden in de `details`-sectie gelogd zodat je het gedrag kunt reproduceren.
 
 ### Headless fallback (optioneel)
 
@@ -128,8 +145,8 @@ Gebruik `docker compose down` om de stack te stoppen. Pas indien nodig de poorte
 ## Ethische richtlijnen
 
 - Scan alleen doelen waarvoor je expliciete toestemming hebt.
-- De tool doet geen brute-force, maar sommige checks (bv. backup-bestanden) sturen extra requests. Gebruik lage frequentie en respecteer robots/ToS.
-- Voor diepgaande pentests blijft inzet van gespecialiseerde tooling (OWASP ZAP, Burp, Nessus, …) en professioneel personeel noodzakelijk.
+- De tool doet geen brute-force, maar sommige checks (bv. backup-bestanden en de actieve formulierprobe) sturen extra requests. Gebruik lage frequentie en respecteer robots/ToS.
+- Voor diepgaande pentests blijft inzet van gespecialiseerde tooling (OWASP ZAP, Burp, Nessus, …) en professioneel personeel noodzakelijk; deze pentest-module is beperkt tot veilige probe-requests.
 
 ## Verdere ideeën
 
