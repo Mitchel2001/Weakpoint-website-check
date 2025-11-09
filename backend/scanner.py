@@ -45,7 +45,8 @@ SEVERITY_CRITICAL = "critical"
 SEVERITY_IMPORTANT = "important"
 SEVERITY_NICE = "nice-to-have"
 
-DEFAULT_MAX_PAGES = 80
+DEFAULT_MAX_PAGES = 150
+DEFAULT_PAGE_BUDGET = 50
 DEFAULT_MAX_DEPTH = 4
 MAX_SEED_URLS = 120
 MAX_SITEMAP_URLS = 60
@@ -326,9 +327,13 @@ def _read_limit_from_env(var_name: str, default: int, minimum: int) -> int:
     return max(minimum, parsed)
 
 
-def _get_scan_limits() -> Tuple[int, int]:
-    max_pages = _read_limit_from_env("WEAKPOINT_MAX_PAGES", DEFAULT_MAX_PAGES, 8)
+def _get_scan_limits(user_max_pages: Optional[int] = None) -> Tuple[int, int]:
+    configured_cap = _read_limit_from_env("WEAKPOINT_MAX_PAGES", DEFAULT_MAX_PAGES, 8)
     max_depth = _read_limit_from_env("WEAKPOINT_MAX_DEPTH", DEFAULT_MAX_DEPTH, 2)
+    if user_max_pages is None:
+        max_pages = min(configured_cap, DEFAULT_PAGE_BUDGET)
+    else:
+        max_pages = max(8, min(user_max_pages, configured_cap))
     return max_pages, max_depth
 
 
@@ -607,20 +612,24 @@ def _crawl_site(
         if candidate in visited:
             continue
         resp = _safe_request(candidate, allow_redirects=True)
-        visited.add(candidate)
         if resp is None:
+            visited.add(candidate)
             continue
         normalized_final = _normalize_url(resp.url)
         if normalized_final in visited:
+            visited.add(candidate)
             continue
         if resp.status_code >= 500:
             visited.add(normalized_final)
+            visited.add(candidate)
             continue
         if not _is_html_response(resp):
             visited.add(normalized_final)
+            visited.add(candidate)
             continue
         snapshot = _snapshot_from_response(resp)
         snapshots.append(snapshot)
+        visited.add(candidate)
         visited.add(normalized_final)
         _notify_progress(
             progress_callback,
@@ -2130,7 +2139,9 @@ NICE_CHECKS = [
 
 
 def run_scan(
-    target_url: str, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    target_url: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    max_pages_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     _notify_progress(
         progress_callback,
@@ -2159,7 +2170,7 @@ def run_scan(
         headers={k: v for k, v in resp.headers.items()},
     )
     seed_urls = _build_seed_urls(base, parsed_response.hostname, robots_txt, sitemap_pages)
-    max_pages, max_depth = _get_scan_limits()
+    max_pages, max_depth = _get_scan_limits(max_pages_override)
     _notify_progress(
         progress_callback,
         {"type": "phase", "phase": "crawl", "progress": 18},
@@ -2251,8 +2262,14 @@ def main() -> None:
         default="report.json",
         help="Bestand waar het JSON rapport wordt opgeslagen.",
     )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=None,
+        help="Maximale aantal pagina's dat wordt gecrawld (standaard automatisch 50).",
+    )
     args = parser.parse_args()
-    report = run_scan(args.url)
+    report = run_scan(args.url, max_pages_override=args.max_pages)
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
     print(f"Rapport opgeslagen in {args.output}")

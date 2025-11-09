@@ -20,10 +20,21 @@ const SCAN_PHASES = [
   { id: 'report', title: 'Rapport samenstellen', start: 88, description: 'Alles netjes bundelen en scores berekenen.' }
 ];
 
+const PAGE_LIMITS = {
+  min: 20,
+  max: 150,
+  step: 10,
+  default: 50
+};
+
 const buildApiUrl = (path) => (API_BASE_URL ? `${API_BASE_URL}${path}` : path);
 
-const buildStreamUrl = (targetUrl) => {
-  const base = buildApiUrl(`/api/scan/stream?url=${encodeURIComponent(targetUrl)}`);
+const buildStreamUrl = (targetUrl, maxPages) => {
+  const params = new URLSearchParams({ url: targetUrl });
+  if (typeof maxPages === 'number') {
+    params.set('max_pages', String(maxPages));
+  }
+  const base = buildApiUrl(`/api/scan/stream?${params.toString()}`);
   if (base.startsWith('http')) {
     return base;
   }
@@ -55,6 +66,8 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState([]);
+  const [maxPagesBudget, setMaxPagesBudget] = useState(PAGE_LIMITS.default);
+  const [activeBudget, setActiveBudget] = useState(PAGE_LIMITS.default);
   const [scanPages, setScanPages] = useState([]);
   const [pagesScanned, setPagesScanned] = useState(0);
   const [progress, setProgress] = useState(0);
@@ -100,8 +113,9 @@ export default function App() {
     setPagesScanned(0);
     setProgress(5);
     setPhaseOverride(null);
+    setActiveBudget(maxPagesBudget);
     closeStream();
-    const streamTarget = buildStreamUrl(url);
+    const streamTarget = buildStreamUrl(url, maxPagesBudget);
     if (typeof window === 'undefined' || typeof window.EventSource === 'undefined') {
       setError('Deze browser ondersteunt geen live scan updates.');
       setLoading(false);
@@ -125,6 +139,9 @@ export default function App() {
             setPagesScanned((prev) => prev + 1);
           }
           setProgress((prev) => Math.max(prev, payload.progress ?? prev));
+          if (typeof payload.budget === 'number') {
+            setActiveBudget(payload.budget);
+          }
         } else if (payload.type === 'phase') {
           if (payload.phase) {
             setPhaseOverride(payload.phase);
@@ -135,15 +152,18 @@ export default function App() {
         } else if (payload.type === 'report') {
           const finishedUrl = activeScanUrlRef.current || payload?.report?.meta?.target;
           const pagesCount = payload.report?.meta?.pages_scanned ?? pagesScanned ?? 0;
+          const maxBudget = payload.report?.meta?.max_pages_budget ?? activeBudget ?? maxPagesBudget;
           setReport(payload.report);
           setPagesScanned(pagesCount);
+          setActiveBudget(maxBudget);
           setHistory((prev) => [
             {
               url: finishedUrl,
               at: new Date().toISOString(),
               status: payload.report?.meta?.status_code,
               finalUrl: payload.report?.meta?.final_url,
-              pages: pagesCount
+              pages: pagesCount,
+              budget: maxBudget
             },
             ...prev
           ].slice(0, 5));
@@ -154,6 +174,7 @@ export default function App() {
         } else if (payload.type === 'error') {
           setError(payload.message || 'Scan kon niet worden afgerond.');
           setLoading(false);
+          setActiveBudget(maxPagesBudget);
           closeStream();
           activeScanUrlRef.current = '';
         }
@@ -165,6 +186,7 @@ export default function App() {
     stream.onerror = () => {
       setError('Verbinding met scanservice verbroken.');
       setLoading(false);
+      setActiveBudget(maxPagesBudget);
       closeStream();
       activeScanUrlRef.current = '';
     };
@@ -223,6 +245,29 @@ export default function App() {
                 {loading ? 'Scannen...' : 'Start scan'}
               </button>
             </div>
+            <div className="page-budget">
+              <div className="page-budget__head">
+                <label htmlFor="pageBudget">Max. pagina&apos;s per scan</label>
+                <span className="page-budget__value">{maxPagesBudget} pagina&apos;s</span>
+              </div>
+              <input
+                id="pageBudget"
+                type="range"
+                min={PAGE_LIMITS.min}
+                max={PAGE_LIMITS.max}
+                step={PAGE_LIMITS.step}
+                value={maxPagesBudget}
+                onChange={(event) => setMaxPagesBudget(Number(event.target.value))}
+                disabled={loading}
+              />
+              <div className="page-budget__ticks">
+                <span>Snelle scan (tot 50)</span>
+                <span>Volledige scan (tot 150)</span>
+              </div>
+              <p className="page-budget__hint">
+                Standaard beperken we de crawler tot 50 pagina&apos;s zodat hij niet vastloopt. Verhoog alleen voor grotere sites.
+              </p>
+            </div>
           </form>
           {loading && (
             <div className="scan-inline-status" role="status" aria-live="polite">
@@ -235,7 +280,9 @@ export default function App() {
               </div>
               <p className="scan-inline-status__phase">{currentPhase.title}</p>
               <p className="scan-inline-status__copy">{currentPhase.description}</p>
-              <p className="scan-inline-status__count">Pagina&apos;s gescand: {pagesScanned}</p>
+              <p className="scan-inline-status__count">
+                Pagina&apos;s gescand: {pagesScanned} / {activeBudget}
+              </p>
               {scanPages.length === 0 ? (
                 <p className="scan-inline-status__empty">
                   We tonen hier meteen de pagina&apos;s zodra ze binnenkomen.
@@ -279,6 +326,10 @@ export default function App() {
                 <p className="label">Scan tijd</p>
                 <p className="value">{new Date(meta.timestamp).toLocaleString()}</p>
               </div>
+              <div>
+                <p className="label">Pagina budget</p>
+                <p className="value">{meta.max_pages_budget}</p>
+              </div>
             </div>
           )}
           {score && summaryStats && (
@@ -292,13 +343,14 @@ export default function App() {
             <ul>
               {history.map((item) => {
                 const pagesLabel = typeof item.pages === 'number' ? item.pages : 0;
+                const budgetLabel = typeof item.budget === 'number' ? item.budget : '-';
                 return (
                   <li key={`${item.url}-${item.at}`}>
                     <span>{new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                     <span>{item.url}</span>
                     <span className="muted">→ {item.finalUrl ?? '-'}</span>
                     <span className="muted">status {item.status ?? '?'}</span>
-                    <span className="muted">{`${pagesLabel} pagina's`}</span>
+                    <span className="muted">{`${pagesLabel} pagina's (budget ${budgetLabel})`}</span>
                   </li>
                 );
               })}

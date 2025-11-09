@@ -47,15 +47,24 @@ uvicorn backend.app:app --reload --port 8000
 Je kunt de scanner ook rechtstreeks draaien zonder de API:
 
 ```powershell
-python -m backend.scanner --url https://example.com --output report.json
+python -m backend.scanner --url https://example.com --output report.json --max-pages 120
 ```
+
+Gebruik `--max-pages` om tijdelijk een andere limiet af te dwingen; laat de vlag weg om de standaard (50 pagina's per scan) aan te houden.
 
 ### API endpoints
 
 | Methode | Pad | Body | Beschrijving |
 | --- | --- | --- | --- |
 | `GET` | `/healthz` | – | Gezondheidscheck (handig voor k8s/compose). |
-| `POST` | `/api/scan` | `{ "url": "https://voorbeeld.nl" }` | Draait alle checks en retourneert het rapport (`meta`, `critical`, `important`, `pentest`, `nice_to_have`). |
+| `POST` | `/api/scan` | `{ "url": "https://voorbeeld.nl", "max_pages": 120 }` (optioneel) | Draait alle checks en retourneert het rapport (`meta`, `critical`, `important`, `pentest`, `nice_to_have`). |
+| `GET` | `/api/scan/stream` | Query: `?url=https://voorbeeld.nl&max_pages=120` | Server-Sent Events stream voor live voortgang inclusief gescande pagina's en het eindrapport. |
+
+### Pagina-limieten en defaults
+
+- De frontend bevat een schuif (20-150 pagina's) met standaardwaarde 50 zodat grote sites direct resultaat geven zonder dat de crawler vastloopt.
+- Zowel de API-body als de stream-endpoint accepteren `max_pages`; laat de parameter weg om de standaard 50 pagina's te gebruiken.
+- `WEAKPOINT_MAX_PAGES` is het harde backend-maximum (default 150). Zet je deze lager, dan clampen API en UI de waarde automatisch.
 
 Voorbeeld responsefragment:
 

@@ -6,16 +6,22 @@ from datetime import datetime, timezone
 from queue import Queue
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 
-from .scanner import run_scan
+from .scanner import DEFAULT_MAX_PAGES, run_scan
 
 
 class ScanRequest(BaseModel):
     url: HttpUrl
+    max_pages: Optional[int] = Field(
+        default=None,
+        ge=8,
+        le=DEFAULT_MAX_PAGES,
+        description="Maximaal aantal pagina's dat tijdens deze scan wordt bezocht.",
+    )
 
 
 app = FastAPI(
@@ -40,14 +46,22 @@ def healthcheck():
 @app.post("/api/scan", tags=["scan"])
 def scan(payload: ScanRequest):
     try:
-        report = run_scan(str(payload.url))
+        report = run_scan(str(payload.url), max_pages_override=payload.max_pages)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return report
 
 
 @app.get("/api/scan/stream", tags=["scan"])
-def scan_stream(url: HttpUrl):
+def scan_stream(
+    url: HttpUrl,
+    max_pages: Optional[int] = Query(
+        default=None,
+        ge=8,
+        le=DEFAULT_MAX_PAGES,
+        description="Optioneel maximaal aantal pagina's voor deze scan.",
+    ),
+):
     event_queue: "Queue[Optional[dict]]" = Queue()
 
     def progress(event: dict) -> None:
@@ -59,7 +73,7 @@ def scan_stream(url: HttpUrl):
 
     def worker() -> None:
         try:
-            report = run_scan(str(url), progress_callback=progress)
+            report = run_scan(str(url), progress_callback=progress, max_pages_override=max_pages)
             event_queue.put(
                 {
                     "type": "report",
