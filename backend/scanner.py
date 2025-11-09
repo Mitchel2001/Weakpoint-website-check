@@ -52,6 +52,9 @@ MAX_SEED_URLS = 120
 MAX_SITEMAP_URLS = 60
 MAX_ROBOTS_ALLOW_PATHS = 20
 MAX_REFLECTION_TESTS = 8
+HTTP_METHOD_ENDPOINT_LIMIT = 6
+SQLI_ACTIVE_PARAM_LIMIT = 6
+SQLI_ACTIVE_PAYLOADS = ["'", "' OR '1'='1"]
 REFLECTION_PARAM = "__weakpoint_probe"
 HEADLESS_TRIGGER_CODES = {401, 403, 406, 429, 451}
 HEADLESS_ENV_FLAG = os.getenv("WEAKPOINT_HEADLESS", "0") == "1"
@@ -67,7 +70,23 @@ SQL_ERROR_PATTERNS = [
 ]
 
 PENTEST_FORM_LIMIT = 8
-PENTEST_PAYLOAD_TEMPLATE = "\"'><weakpoint-{token}>"
+PENTEST_PAYLOADS = [
+    {
+        "id": "xss",
+        "label": "XSS reflectie",
+        "template": "\"'><weakpoint-{token}>",
+    },
+    {
+        "id": "sql",
+        "label": "SQL injectie",
+        "template": "' OR '1'='1'--weakpoint-{token}",
+    },
+    {
+        "id": "ssti",
+        "label": "Template injectie",
+        "template": "{{7*7}}weakpoint-{token}",
+    },
+]
 
 try:
     from playwright.sync_api import sync_playwright
@@ -167,6 +186,44 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
 
 
+def _load_auth_configuration() -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    bearer = os.getenv("WEAKPOINT_AUTH_BEARER")
+    if bearer:
+        SESSION.headers["Authorization"] = f"Bearer {bearer.strip()}"
+        config["authorization"] = "bearer"
+
+    custom_header = os.getenv("WEAKPOINT_AUTH_HEADER")
+    if custom_header:
+        if ":" in custom_header:
+            name, value = custom_header.split(":", 1)
+            header_name = name.strip()
+            if header_name:
+                SESSION.headers[header_name] = value.strip()
+                config.setdefault("extra_headers", []).append(header_name)
+        else:
+            config["invalid_header_format"] = True
+
+    cookie_blob = os.getenv("WEAKPOINT_AUTH_COOKIES")
+    if cookie_blob:
+        try:
+            parsed_cookies = json.loads(cookie_blob)
+        except json.JSONDecodeError:
+            parsed_cookies = None
+        if isinstance(parsed_cookies, dict):
+            for key, value in parsed_cookies.items():
+                SESSION.cookies.set(key, value)
+            config["cookies"] = sorted(parsed_cookies.keys())
+        else:
+            SESSION.headers["Cookie"] = cookie_blob
+            config["cookies_raw"] = True
+
+    return config
+
+
+AUTH_CONTEXT = _load_auth_configuration()
+
+
 @dataclass
 class PageSnapshot:
     url: str
@@ -201,6 +258,7 @@ class ScanContext:
     robots_txt: Optional[str]
     sitemap_found: bool
     pages: List[PageSnapshot] = field(default_factory=list)
+    auth: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def parsed_url(self):
@@ -244,6 +302,32 @@ def _append_query_param(url: str, key: str, value: str) -> str:
     query = parse_qsl(parsed.query, keep_blank_values=True)
     query.append((key, value))
     new_query = urlencode(query)
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path or "/",
+            parsed.params,
+            new_query,
+            parsed.fragment,
+        )
+    )
+
+
+def _replace_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    replaced = False
+    new_pairs = []
+    for existing_key, existing_value in query:
+        if not replaced and existing_key == key:
+            new_pairs.append((existing_key, value))
+            replaced = True
+        else:
+            new_pairs.append((existing_key, existing_value))
+    if not replaced:
+        new_pairs.append((key, value))
+    new_query = urlencode(new_pairs)
     return urlunparse(
         (
             parsed.scheme,
@@ -1152,29 +1236,56 @@ def _check_cookies(context: ScanContext) -> CheckResult:
 def _check_http_methods(context: ScanContext) -> CheckResult:
     parsed = context.parsed_url
     base = f"{parsed.scheme}://{parsed.netloc}"
-    allow_details: Dict[str, Any] = {}
-    methods_with_risk = []
+    pages = _iter_pages(context)
 
-    options_resp = _safe_request(base, method="OPTIONS", timeout=6, allow_redirects=False)
-    if options_resp is not None:
-        allow = options_resp.headers.get("Allow") or options_resp.headers.get("allow")
-        if allow:
-            verbs = {verb.strip().upper() for verb in allow.split(",")}
-            allow_details["allow_header"] = sorted(verbs)
-            for risky in {"TRACE", "PUT", "DELETE"}:
-                if risky in verbs:
-                    methods_with_risk.append(risky)
+    candidates: List[str] = [base]
+    seen: Set[str] = {base}
 
-    trace_resp = _safe_request(base, method="TRACE", timeout=6, allow_redirects=False)
-    if trace_resp is not None and trace_resp.status_code < 400:
-        methods_with_risk.append("TRACE (direct toegestaan)")
-        allow_details["trace_status"] = trace_resp.status_code
+    def register(url: str) -> None:
+        normalized = _normalize_url(url)
+        if normalized not in seen and len(candidates) < HTTP_METHOD_ENDPOINT_LIMIT:
+            seen.add(normalized)
+            candidates.append(normalized)
 
-    status = STATUS_PASS if not methods_with_risk else STATUS_WARN
+    for page in pages:
+        register(page.url)
+        for form in page.soup.find_all("form"):
+            action = form.get("action")
+            if not action:
+                continue
+            target = urljoin(page.url, action)
+            parsed_target = urlparse(target)
+            if parsed_target.scheme in {"http", "https"} and _hosts_match(parsed.hostname, parsed_target.hostname):
+                register(target)
+
+    findings: List[str] = []
+    tested_endpoints: List[Dict[str, Any]] = []
+
+    for candidate in candidates:
+        endpoint_result: Dict[str, Any] = {"url": candidate}
+        options_resp = _safe_request(candidate, method="OPTIONS", timeout=6, allow_redirects=False)
+        if options_resp is not None:
+            allow = options_resp.headers.get("Allow") or options_resp.headers.get("allow")
+            if allow:
+                verbs = {verb.strip().upper() for verb in allow.split(",") if verb.strip()}
+                endpoint_result["allow_header"] = sorted(verbs)
+                risky = sorted(verb for verb in verbs if verb in {"TRACE", "PUT", "DELETE"})
+                if risky:
+                    findings.append(f"{candidate} -> {', '.join(risky)}")
+
+        trace_resp = _safe_request(candidate, method="TRACE", timeout=6, allow_redirects=False)
+        if trace_resp is not None:
+            endpoint_result["trace_status"] = trace_resp.status_code
+            if trace_resp.status_code < 400:
+                findings.append(f"{candidate} -> TRACE toegestaan")
+
+        tested_endpoints.append(endpoint_result)
+
+    status = STATUS_PASS if not findings else STATUS_WARN
     summary = (
         "Onveilige HTTP methodes lijken geblokkeerd."
-        if not methods_with_risk
-        else "Risicovolle methodes toegestaan: " + ", ".join(sorted(set(methods_with_risk)))
+        if not findings
+        else "Risicovolle methodes toegestaan: " + "; ".join(sorted(set(findings)))
     )
     remediation = "Blokkeer TRACE/PUT/DELETE voor publieke origin en beperk OPTIONS responses."
     impact = (
@@ -1190,7 +1301,7 @@ def _check_http_methods(context: ScanContext) -> CheckResult:
         summary=summary,
         remediation=remediation,
         impact=impact,
-        details=allow_details or None,
+        details={"tested_endpoints": tested_endpoints} if tested_endpoints else None,
     )
 
 
@@ -1199,6 +1310,7 @@ def _check_forms(context: ScanContext) -> CheckResult:
     insecure: List[Dict[str, Any]] = []
     total_forms = 0
     pages_with_forms: Set[str] = set()
+    form_details: List[Dict[str, Any]] = []
 
     for page in pages:
         forms = page.soup.find_all("form")
@@ -1208,6 +1320,8 @@ def _check_forms(context: ScanContext) -> CheckResult:
         for idx, form in enumerate(forms, start=1):
             total_forms += 1
             method = (form.get("method") or "get").lower()
+            action = form.get("action") or page.url
+            target = urljoin(page.url, action)
             inputs = form.find_all(["input", "textarea"])
             text_inputs = [
                 field
@@ -1215,14 +1329,48 @@ def _check_forms(context: ScanContext) -> CheckResult:
                 if field.get("type", "text").lower()
                 in ("text", "email", "password", "tel", "number")
             ]
+            field_metadata: List[Dict[str, Any]] = []
             for field in text_inputs:
+                input_type = field.get("type", "text").lower()
+                name = field.get("name") or field.get("id")
+                field_metadata.append(
+                    {
+                        "name": name,
+                        "type": input_type,
+                        "required": field.has_attr("required"),
+                        "pattern": bool(field.get("pattern")),
+                        "inputmode": field.get("inputmode"),
+                        "autocomplete": field.get("autocomplete"),
+                    }
+                )
                 if not field.has_attr("required") and not field.get("pattern"):
                     insecure.append(
                         {
                             "page": page.url,
                             "form": idx,
-                            "input": field.get("name") or field.get("id"),
+                            "action": target,
+                            "input": name,
                             "reason": "Geen verplichting/patroon; validering ontbreekt mogelijk server-side.",
+                        }
+                    )
+                if input_type in {"password", "email", "tel"} and not field.get("autocomplete"):
+                    insecure.append(
+                        {
+                            "page": page.url,
+                            "form": idx,
+                            "action": target,
+                            "input": name,
+                            "reason": "Geen autocomplete-profiel voor gevoelig veld; gebruikers vullen mogelijk willekeurig in.",
+                        }
+                    )
+                if input_type in {"number", "tel"} and not field.get("inputmode"):
+                    insecure.append(
+                        {
+                            "page": page.url,
+                            "form": idx,
+                            "action": target,
+                            "input": name,
+                            "reason": "Geen inputmode voor numerieke invoer; verhoog server-side validatie.",
                         }
                     )
             if method != "post" and any(
@@ -1232,9 +1380,26 @@ def _check_forms(context: ScanContext) -> CheckResult:
                     {
                         "page": page.url,
                         "form": idx,
+                        "action": target,
                         "reason": "Wachtwoordformulier gebruikt GET i.p.v. POST.",
                     }
                 )
+
+            form_details.append(
+                {
+                    "page": page.url,
+                    "form": idx,
+                    "action": target,
+                    "method": method.upper(),
+                    "text_field_count": len(text_inputs),
+                    "client_side_validations": {
+                        "required": sum(1 for meta in field_metadata if meta["required"]),
+                        "pattern": sum(1 for meta in field_metadata if meta["pattern"]),
+                        "inputmode": sum(1 for meta in field_metadata if meta["inputmode"]),
+                        "autocomplete": sum(1 for meta in field_metadata if meta["autocomplete"]),
+                    },
+                }
+            )
 
     status = STATUS_PASS if not insecure else STATUS_WARN
     if not pages_with_forms:
@@ -1265,6 +1430,7 @@ def _check_forms(context: ScanContext) -> CheckResult:
             "total_forms": total_forms,
             "pages_with_forms": sorted(pages_with_forms)[:10],
             "issues": insecure[:15],
+            "form_inventory": form_details[:15],
         },
     )
 
@@ -1333,22 +1499,64 @@ def _check_reflection_probes(context: ScanContext) -> CheckResult:
     findings: List[Dict[str, Any]] = []
 
     for page in sampled_pages:
-        token = f"wp_reflect_{random.randint(10_000, 99_999)}"
-        probe_url = _append_query_param(page.url, REFLECTION_PARAM, token)
-        resp = _safe_request(probe_url, allow_redirects=True)
-        if not resp or resp.status_code >= 500:
-            continue
-        html = resp.text or ""
-        if token in html:
-            findings.append(
+        base_token = f"wp_reflect_{random.randint(10_000, 99_999)}"
+        vectors = [
+            (
+                "query",
+                _append_query_param(page.url, REFLECTION_PARAM, f"{base_token}_q"),
+                {"method": "GET"},
+            ),
+            (
+                "form",
+                page.url,
                 {
-                    "page": resp.url,
-                    "token": token,
-                    "status_code": resp.status_code,
-                }
+                    "method": "POST",
+                    "data": {REFLECTION_PARAM: f"{base_token}_f"},
+                },
+            ),
+            (
+                "json",
+                page.url,
+                {
+                    "method": "POST",
+                    "json": {REFLECTION_PARAM: f"{base_token}_j"},
+                    "headers": {"Content-Type": "application/json"},
+                },
+            ),
+        ]
+
+        for vector, url, options in vectors:
+            method = options.get("method", "GET")
+            data = options.get("data")
+            json_payload = options.get("json")
+            extra_headers = options.get("headers")
+            resp = _safe_request(
+                url,
+                method=method,
+                allow_redirects=True,
+                data=data,
+                json=json_payload,
+                headers=extra_headers,
             )
-            if len(findings) >= MAX_REFLECTION_TESTS:
-                break
+            if not resp or resp.status_code >= 500:
+                continue
+            html = resp.text or ""
+            marker = (data or json_payload or {}).get(REFLECTION_PARAM)
+            if marker is None and "_q" in url:
+                marker = f"{base_token}_q"
+            if marker and marker in html:
+                findings.append(
+                    {
+                        "page": resp.url,
+                        "token": marker,
+                        "vector": vector,
+                        "status_code": resp.status_code,
+                    }
+                )
+                if len(findings) >= MAX_REFLECTION_TESTS:
+                    break
+        if len(findings) >= MAX_REFLECTION_TESTS:
+            break
 
     status = STATUS_FAIL if findings else STATUS_INFO
     if findings:
@@ -1380,16 +1588,63 @@ def _check_reflection_probes(context: ScanContext) -> CheckResult:
 def _check_sql_errors(context: ScanContext) -> CheckResult:
     pages = _iter_pages(context)
     hits: List[Dict[str, Any]] = []
+    active_hits: List[Dict[str, Any]] = []
+    tested_params = 0
     for page in pages:
         html = page.html.lower()
         found = sorted({pattern for pattern in SQL_ERROR_PATTERNS if pattern in html})
         if found:
             hits.append({"page": page.url, "patterns": found})
 
-    status = STATUS_FAIL if hits else STATUS_INFO
-    if hits:
-        summary = f"Database foutmeldingen zichtbaar op {len(hits)} pagina's."
-        impact = "Gedetailleerde fouten verraden tabelnamen of queries die aanvallers kunnen gebruiken voor SQL-injectie."
+        if tested_params >= SQLI_ACTIVE_PARAM_LIMIT:
+            continue
+        parsed_page = urlparse(page.url)
+        params = parse_qsl(parsed_page.query, keep_blank_values=True)
+        if not params:
+            continue
+        for key, _ in params:
+            if tested_params >= SQLI_ACTIVE_PARAM_LIMIT:
+                break
+            for payload in SQLI_ACTIVE_PAYLOADS:
+                if tested_params >= SQLI_ACTIVE_PARAM_LIMIT:
+                    break
+                crafted_url = _replace_query_param(page.url, key, payload)
+                resp = _safe_request(crafted_url, allow_redirects=True)
+                tested_params += 1
+                if resp is None:
+                    continue
+                lowered = (resp.text or "").lower()
+                evidence = sorted(
+                    {pattern for pattern in SQL_ERROR_PATTERNS if pattern in lowered}
+                )
+                if evidence or resp.status_code >= 500:
+                    active_hits.append(
+                        {
+                            "page": page.url,
+                            "tested_url": crafted_url,
+                            "param": key,
+                            "payload": payload,
+                            "status_code": resp.status_code,
+                            "patterns": evidence,
+                        }
+                    )
+                    break
+
+    status = STATUS_FAIL if (hits or active_hits) else STATUS_INFO
+    if hits or active_hits:
+        passive_count = len(hits)
+        active_count = len(active_hits)
+        summary_parts = []
+        if passive_count:
+            summary_parts.append(
+                f"Database foutmeldingen zichtbaar op {passive_count} pagina's"
+            )
+        if active_count:
+            summary_parts.append(
+                f"Injectieprobes veroorzaakten errors bij {active_count} parameter(s)"
+            )
+        summary = "; ".join(summary_parts)
+        impact = "Gedetailleerde fouten of responses na injectie helpen aanvallers payloads te verfijnen en data te lezen."
     else:
         summary = "Geen DB foutmeldingen gevonden in responses."
         impact = "De applicatie lekt geen databasefouten waardoor misbruik lastiger is."
@@ -1402,18 +1657,28 @@ def _check_sql_errors(context: ScanContext) -> CheckResult:
         summary=summary,
         remediation=remediation,
         impact=impact,
-        details={"pages": hits[:10]},
+        details={
+            "pages": hits[:10],
+            "active_vectors": active_hits[:10],
+            "tested_params": tested_params,
+        },
     )
 
 
 def _check_active_form_attacks(context: ScanContext) -> CheckResult:
     pages = _iter_pages(context)
-    token = f"{random.randint(100000, 999999)}"
-    payload = PENTEST_PAYLOAD_TEMPLATE.format(token=token)
-    reflections: List[Dict[str, Any]] = []
-    sanitized: List[Dict[str, Any]] = []
-    sql_errors: List[Dict[str, Any]] = []
-    blocked: List[Dict[str, Any]] = []
+    seed_token = f"{random.randint(100000, 999999)}"
+    payload_results: Dict[str, Dict[str, Any]] = {}
+    for payload in PENTEST_PAYLOADS:
+        payload_results[payload["id"]] = {
+            "label": payload["label"],
+            "template": payload["template"],
+            "reflections": [],
+            "sanitized": [],
+            "sql_errors": [],
+            "executed": [],
+            "blocked": [],
+        }
     tested = 0
 
     for page in pages:
@@ -1447,38 +1712,85 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
                 continue
 
             tested += 1
-            data = {name: payload for name in field_names}
-            if method == "post":
-                resp = _safe_request(target, method="POST", data=data, timeout=DEFAULT_TIMEOUT)
-            else:
-                resp = _safe_request(target, method="GET", params=data, timeout=DEFAULT_TIMEOUT)
+            for payload in PENTEST_PAYLOADS:
+                payload_id = payload["id"]
+                marker = f"{seed_token}-{payload_id}-{tested}"
+                value = payload["template"].format(token=marker)
+                data = {name: value for name in field_names}
+                if method == "post":
+                    resp = _safe_request(
+                        target, method="POST", data=data, timeout=DEFAULT_TIMEOUT
+                    )
+                else:
+                    resp = _safe_request(
+                        target, method="GET", params=data, timeout=DEFAULT_TIMEOUT
+                    )
 
-            if resp is None:
-                blocked.append(
-                    {
-                        "page": page.url,
-                        "target": target,
-                        "form_index": idx,
-                        "reason": "no-response",
-                    }
-                )
-                continue
+                result_bucket = payload_results[payload_id]
 
-            text = resp.text or ""
-            lowered = text.lower()
-            marker = f"weakpoint-{token}".lower()
-            if f"<weakpoint-{token}>" in text:
-                reflections.append(
-                    {
-                        "page": page.url,
-                        "target": target,
-                        "form_index": idx,
-                        "status_code": resp.status_code,
-                    }
-                )
-            elif marker in lowered:
-                if f"&lt;weakpoint-{token}&gt;" in lowered:
-                    sanitized.append(
+                if resp is None:
+                    result_bucket["blocked"].append(
+                        {
+                            "page": page.url,
+                            "target": target,
+                            "form_index": idx,
+                            "reason": "no-response",
+                        }
+                    )
+                    continue
+
+                text = resp.text or ""
+                lowered = text.lower()
+                marker_lower = marker.lower()
+
+                if payload_id == "xss":
+                    raw_marker = f"<weakpoint-{marker}>"
+                    if raw_marker in text:
+                        result_bucket["reflections"].append(
+                            {
+                                "page": page.url,
+                                "target": target,
+                                "form_index": idx,
+                                "status_code": resp.status_code,
+                            }
+                        )
+                    elif f"weakpoint-{marker_lower}" in lowered:
+                        if f"&lt;weakpoint-{marker_lower}&gt;" in lowered:
+                            result_bucket["sanitized"].append(
+                                {
+                                    "page": page.url,
+                                    "target": target,
+                                    "form_index": idx,
+                                    "status_code": resp.status_code,
+                                }
+                            )
+                elif payload_id == "sql":
+                    hits = sorted(
+                        {pattern for pattern in SQL_ERROR_PATTERNS if pattern in lowered}
+                    )
+                    if hits:
+                        result_bucket["sql_errors"].append(
+                            {
+                                "page": page.url,
+                                "target": target,
+                                "form_index": idx,
+                                "status_code": resp.status_code,
+                                "patterns": hits,
+                            }
+                        )
+                elif payload_id == "ssti":
+                    if f"49weakpoint-{marker_lower}" in lowered or f"weakpoint-{marker_lower}" in lowered:
+                        result_bucket["executed"].append(
+                            {
+                                "page": page.url,
+                                "target": target,
+                                "form_index": idx,
+                                "status_code": resp.status_code,
+                            }
+                        )
+
+                if resp.status_code >= 400:
+                    result_bucket["blocked"].append(
                         {
                             "page": page.url,
                             "target": target,
@@ -1487,56 +1799,32 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
                         }
                     )
 
-            hits = sorted({pattern for pattern in SQL_ERROR_PATTERNS if pattern in lowered})
-            if hits:
-                sql_errors.append(
-                    {
-                        "page": page.url,
-                        "target": target,
-                        "form_index": idx,
-                        "status_code": resp.status_code,
-                        "patterns": hits,
-                    }
-                )
-
-            if resp.status_code >= 400:
-                blocked.append(
-                    {
-                        "page": page.url,
-                        "target": target,
-                        "form_index": idx,
-                        "status_code": resp.status_code,
-                    }
-                )
-
     status = STATUS_PASS
     summary = "Formulieren filteren actieve payloads of reageren veilig."
     remediation = "Blijf input valideren en ontsmetten; monitor WAF-logs op afwijkingen."
     impact = "Aanvallers krijgen geen directe feedback om XSS/SQL-injectie via formulieren te misbruiken."
 
-    if reflections or sql_errors:
+    fail_messages: List[str] = []
+    total_blocked = 0
+    for payload_id, result in payload_results.items():
+        if result["reflections"] or result["sql_errors"] or result["executed"]:
+            fail_messages.append(
+                f"{result['label']}: {len(result['reflections']) + len(result['sql_errors']) + len(result['executed'])} treffers"
+            )
+        total_blocked += len(result["blocked"])
+
+    if fail_messages:
         status = STATUS_FAIL
-        parts = []
-        if reflections:
-            parts.append(
-                f"Payload reflecteert ongesanitized op {len(reflections)} formulier(en)."
-            )
-        if sql_errors:
-            parts.append(
-                f"Databasefouten na injectie op {len(sql_errors)} doel(en)."
-            )
-        summary = " ".join(parts)
+        summary = "; ".join(fail_messages)
         remediation = (
             "Valideer en ontsmet invoer server-side, encodeer output en gebruik parameterized queries."
         )
         impact = (
-            "Aanvallers kunnen de reflectie gebruiken voor XSS of de foutmeldingen om SQL-injecties te ontwikkelen."
+            "Aanvallers kunnen de reflectie of foutmeldingen gebruiken om XSS/SSTI/SQL-aanvallen te bouwen."
         )
-    elif blocked:
+    elif total_blocked:
         status = STATUS_WARN
-        summary = (
-            f"Actieve payloads werden geblokkeerd of geweigerd ({len(blocked)} keer)."
-        )
+        summary = f"Actieve payloads werden geblokkeerd of geweigerd ({total_blocked} keer)."
         remediation = (
             "Controleer of blokkades legitiem zijn en documenteer WAF/rate limit regels."
         )
@@ -1544,13 +1832,22 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
             "Blokkade wijst op tegenmaatregelen, maar handmatige review blijft nodig om ev. bypasses uit te sluiten."
         )
 
+    details_payloads = {
+        payload_id: {
+            "label": result["label"],
+            "payload": result["template"],
+            "reflections": result["reflections"][:10],
+            "sanitized": result["sanitized"][:10],
+            "sql_errors": result["sql_errors"][:10],
+            "executed": result["executed"][:10],
+            "blocked": result["blocked"][:10],
+        }
+        for payload_id, result in payload_results.items()
+    }
+
     details: Dict[str, Any] = {
         "tested_forms": tested,
-        "payload": payload,
-        "reflections": reflections[:10],
-        "sanitized": sanitized[:10],
-        "sql_errors": sql_errors[:10],
-        "blocked": blocked[:10],
+        "payloads": details_payloads,
     }
 
     return _build_result(
@@ -1573,8 +1870,12 @@ def _check_auth_session(context: ScanContext) -> CheckResult:
     detailed_issues: List[Dict[str, Any]] = []
     rate_headers_found: Set[str] = set()
     mfa_mentioned = False
+    token_inputs: List[Dict[str, Any]] = []
+    spa_indicators: List[str] = []
+    spa_seen: Set[str] = set()
 
     for page in pages:
+        html_lower = page.html.lower()
         page_headers = {k.lower(): v for k, v in page.headers.items()}
         for key in page_headers:
             if "ratelimit" in key or key == "retry-after":
@@ -1602,10 +1903,39 @@ def _check_auth_session(context: ScanContext) -> CheckResult:
                         "issue": "Geen CSRF-token aangetroffen in formulier.",
                     }
                 )
+            else:
+                token_inputs.append(
+                    {
+                        "page": page.url,
+                        "form": idx,
+                        "name": token.get("name"),
+                    }
+                )
+
+            password_fields = form.find_all("input", {"type": "password"})
+            for field in password_fields:
+                autocomplete = (field.get("autocomplete") or "").lower()
+                if autocomplete not in {"current-password", "new-password"}:
+                    detailed_issues.append(
+                        {
+                            "page": page.url,
+                            "form": idx,
+                            "issue": "Password veld mist autocomplete=current-password/new-password.",
+                        }
+                    )
 
         text = page.soup.get_text(" ", strip=True).lower()
         if any(term in text for term in ("mfa", "twee-factor", "2fa")):
             mfa_mentioned = True
+
+        if any(hint in html_lower for hint in ("authorization", "access_token", "id_token")):
+            if page.url not in spa_seen:
+                spa_seen.add(page.url)
+                spa_indicators.append(page.url)
+        elif re.search(r"/oauth|authorize|login\?.*client_id", page.html, re.I):
+            if page.url not in spa_seen:
+                spa_seen.add(page.url)
+                spa_indicators.append(page.url)
 
     if not rate_headers_found:
         issues.append("Geen rate-limit headers aangetroffen; beperk aanmeldpogingen.")
@@ -1640,6 +1970,9 @@ def _check_auth_session(context: ScanContext) -> CheckResult:
             "login_pages": sorted(login_pages)[:10],
             "issues": detailed_issues[:15],
             "rate_limit_headers": sorted(rate_headers_found),
+            "token_inputs": token_inputs[:10],
+            "spa_indicators": spa_indicators[:10],
+            "auth_configuration": context.auth,
         },
     )
 
@@ -2435,6 +2768,7 @@ def run_scan(
         robots_txt=robots_txt,
         sitemap_found=sitemap_found,
         pages=crawled_pages,
+        auth=AUTH_CONTEXT,
     )
 
     critical_results = [check(context) for check in CRITICAL_CHECKS]
@@ -2484,6 +2818,7 @@ def run_scan(
             "max_pages_budget": max_pages,
             "max_depth_budget": max_depth,
             "seed_urls": seed_urls[:10],
+            "auth_mode": AUTH_CONTEXT,
         },
         "critical": [result.to_dict() for result in critical_results],
         "important": [result.to_dict() for result in important_results],
