@@ -140,6 +140,28 @@ COMMON_LOGIN_PATHS = [
     "/cms",
 ]
 
+DIRECTORY_LISTING_MARKERS = [
+    "index of /",
+    "directory listing",
+    "parent directory",
+]
+
+JS_LIBRARY_BASELINES: Dict[str, Tuple[int, ...]] = {
+    "jquery": (3, 6, 0),
+    "bootstrap": (4, 6, 0),
+    "angular": (1, 8, 3),
+    "react": (17, 0, 2),
+    "vue": (2, 6, 14),
+}
+
+GRAPHQL_COMMON_PATHS = ["/graphql", "/api/graphql", "/graphiql"]
+
+GRAPHQL_INTROSPECTION_QUERY = {
+    "query": (
+        "query WeakPointIntrospection { __schema { queryType { name } mutationType { name } } }"
+    )
+}
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
 
@@ -240,6 +262,26 @@ def _normalize_hostname(host: Optional[str]) -> Optional[str]:
     if normalized.startswith("www."):
         normalized = normalized[4:]
     return normalized
+
+
+def _extract_version_tuple(candidate: str) -> Tuple[int, ...]:
+    match = re.search(r"(\d+(?:\.\d+){0,2})", candidate)
+    if not match:
+        return ()
+    parts = match.group(1).split(".")
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError:
+        return ()
+
+
+def _version_is_older(found: Tuple[int, ...], baseline: Tuple[int, ...]) -> bool:
+    if not found:
+        return False
+    max_len = max(len(found), len(baseline))
+    padded_found = found + (0,) * (max_len - len(found))
+    padded_baseline = baseline + (0,) * (max_len - len(baseline))
+    return padded_found < padded_baseline
 
 
 def _hosts_match(base_host: Optional[str], candidate_host: Optional[str]) -> bool:
@@ -1666,6 +1708,115 @@ def _check_backup_files(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_directory_listing(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    listings: List[Dict[str, Any]] = []
+
+    for page in pages:
+        title = (page.soup.title.string or "") if page.soup.title else ""
+        lower_title = title.strip().lower()
+        lower_html = page.html.lower()
+        has_marker = any(marker in lower_html for marker in DIRECTORY_LISTING_MARKERS)
+        has_title = any(marker in lower_title for marker in DIRECTORY_LISTING_MARKERS)
+        pre = page.soup.find("pre")
+        links = page.soup.find_all("a")
+        looks_like_listing = False
+        if pre and "parent directory" in pre.get_text(" ", strip=True).lower():
+            looks_like_listing = True
+        if len(links) >= 5 and any(
+            (link.get_text(" ", strip=True) or "").lower().startswith("parent directory")
+            for link in links
+        ):
+            looks_like_listing = True
+        if has_marker or has_title or looks_like_listing:
+            listings.append({
+                "url": page.url,
+                "status_code": page.status_code,
+                "title": title.strip(),
+            })
+
+    status = STATUS_FAIL if listings else STATUS_PASS
+    summary = (
+        "Directory listing actief op publiek toegankelijke paden."
+        if listings
+        else "Geen tekenen van directory listing gevonden."
+    )
+    remediation = "Schakel autoindexering uit en plaats een indexbestand of gebruik toegangsrestricties."
+    impact = (
+        "Met directory listing kunnen aanvallers eenvoudig gevoelige bestanden en broncode downloaden."
+        if listings
+        else "Zonder directory listing blijft interne mappenstructuur verborgen voor bezoekers."
+    )
+
+    return _build_result(
+        id="directory_listing",
+        title="Directory listing",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details={"pages": listings[:10]} if listings else None,
+    )
+
+
+def _check_outdated_js_libraries(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    outdated: List[Dict[str, Any]] = []
+    checked_scripts: Set[str] = set()
+
+    for page in pages:
+        for tag in page.soup.find_all("script"):
+            src = tag.get("src")
+            if not src:
+                continue
+            absolute = urljoin(page.url, src)
+            normalized = absolute.split("#")[0]
+            if normalized in checked_scripts:
+                continue
+            checked_scripts.add(normalized)
+            lower_src = normalized.lower()
+            for library, baseline in JS_LIBRARY_BASELINES.items():
+                if library not in lower_src:
+                    continue
+                version_tuple = _extract_version_tuple(lower_src)
+                if not version_tuple:
+                    continue
+                if _version_is_older(version_tuple, baseline):
+                    outdated.append(
+                        {
+                            "library": library,
+                            "detected_version": ".".join(str(part) for part in version_tuple),
+                            "minimum_recommended": ".".join(str(part) for part in baseline),
+                            "script": normalized,
+                        }
+                    )
+
+    status = STATUS_WARN if outdated else STATUS_INFO
+    summary = (
+        "Verouderde JavaScript bibliotheken aangetroffen."
+        if outdated
+        else "Geen duidelijke verouderde JavaScript bibliotheken gevonden."
+    )
+    remediation = "Update CDN/self-hosted bibliotheken naar ondersteunde versies en verwijder ongebruikte libraries."
+    impact = (
+        "Bekende kwetsbaarheden in oude bibliotheken kunnen leiden tot XSS of RCE via derde-partij scripts."
+        if outdated
+        else "Actuele bibliotheken verkleinen de kans op misbruik van bekende kwetsbaarheden."
+    )
+
+    return _build_result(
+        id="js_libraries",
+        title="Verouderde JavaScript componenten",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details={"outdated": outdated[:10]} if outdated else None,
+    )
+
+
 def _check_rate_limiting(context: ScanContext) -> CheckResult:
     pages = _iter_pages(context)
     aggregated: Dict[str, str] = {}
@@ -1773,6 +1924,92 @@ def _check_error_handling(context: ScanContext) -> CheckResult:
         remediation=remediation,
         impact=impact,
         details={"sample": snippet},
+    )
+
+
+def _check_graphql_introspection(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    candidates: Set[str] = set()
+    hint_detected = False
+
+    for page in pages:
+        html_lower = page.html.lower()
+        if "graphql" in html_lower:
+            hint_detected = True
+        parsed = urlparse(page.url)
+        if "graphql" in (parsed.path or "").lower():
+            candidates.add(page.url.split("#")[0])
+        for tag in page.soup.find_all(["form", "a", "script"]):
+            attr = tag.get("action") if tag.name == "form" else tag.get("href") or tag.get("src")
+            if not attr:
+                continue
+            if "graphql" in attr.lower():
+                candidates.add(urljoin(page.url, attr))
+
+    if hint_detected:
+        parsed = context.parsed_url
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        for path in GRAPHQL_COMMON_PATHS:
+            candidates.add(urljoin(base, path))
+
+    tested: List[Dict[str, Any]] = []
+    exposed: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+
+    for endpoint in list(sorted(candidates))[:5]:
+        resp = _safe_request(
+            endpoint,
+            method="POST",
+            json=GRAPHQL_INTROSPECTION_QUERY,
+            timeout=8,
+            headers={"Content-Type": "application/json"},
+        )
+        entry = {"endpoint": endpoint}
+        if resp is None:
+            entry["status"] = "no_response"
+            blocked.append(entry)
+            continue
+        entry["http_status"] = resp.status_code
+        tested.append(entry)
+        try:
+            payload = resp.json()
+        except ValueError:
+            blocked.append(entry)
+            continue
+        schema = payload.get("data", {}).get("__schema")
+        if schema:
+            exposed.append(entry)
+        else:
+            blocked.append(entry)
+
+    if not candidates:
+        status = STATUS_INFO
+        summary = "Geen aanwijzingen voor GraphQL endpoints gevonden tijdens de crawl."
+        impact = "Zonder GraphQL oppervlakte is het risico op introspection misbruik laag."
+    elif exposed:
+        status = STATUS_WARN
+        summary = f"GraphQL introspection open op {len(exposed)} endpoint(s)."
+        impact = "Open introspection lekt schema's en types waardoor aanvallers API-misbruik eenvoudiger plannen."
+    else:
+        status = STATUS_PASS
+        summary = "GraphQL endpoints blokkeren introspection verzoeken."
+        impact = "Geblokkeerde introspection beperkt informatielekken over interne API-structuren."
+
+    return _build_result(
+        id="graphql",
+        title="GraphQL introspection",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation="Schakel introspection uit in productie of bescherm endpoints met authenticatie.",
+        impact=impact,
+        details={
+            "tested": tested[:10],
+            "exposed": exposed[:10],
+            "blocked": blocked[:10],
+        }
+        if candidates
+        else None,
     )
 
 
@@ -2108,8 +2345,11 @@ IMPORTANT_CHECKS = [
     _check_auth_session,
     _check_server_versions,
     _check_backup_files,
+    _check_directory_listing,
+    _check_outdated_js_libraries,
     _check_rate_limiting,
     _check_error_handling,
+    _check_graphql_introspection,
     _check_http_methods,
     _check_security_txt,
     _check_sri,
