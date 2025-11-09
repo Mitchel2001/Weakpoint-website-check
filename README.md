@@ -79,6 +79,21 @@ Voorbeeld responsefragment:
 }
 ```
 
+### Headless fallback (optioneel)
+
+Sommige sites blokkeren standaard HTTP-clients met JavaScript- of WAF-checks. Voor je **eigen** domeinen kun je een headless browser laten meedraaien zodat de scanner dezelfde pagina HTML ontvangt als een echte bezoeker:
+
+1. Installeer Playwright en de Chromium-driver:
+   ```powershell
+   pip install playwright
+   playwright install chromium
+   ```
+2. Zet vóór het starten van de backend de env-var aan: `WEAKPOINT_HEADLESS=1`.
+
+Wanneer een request een blokkerende status (403/429/...) teruggeeft, probeert de scanner opnieuw via Playwright. Gebruik dit alleen intern of met toestemming; het omzeilt client-side checks.
+
+Met `docker compose` gebeurt dit automatisch: het backend-image installeert Playwright/Chromium tijdens de build en de service draait standaard met `WEAKPOINT_HEADLESS=1`.
+
 ## Frontend (React) gebruiken
 
 ```powershell
@@ -107,7 +122,7 @@ Gebruik `docker compose down` om de stack te stoppen. Pas indien nodig de poorte
 ## Samenbrengen (lokale workflow)
 
 1. Start de backend: `uvicorn backend.app:app --reload --port 8000`
-2. Start de frontend: `npm run dev` (Vite) – open daarna `http://localhost:5173`
+2. Start de frontend: `npm run dev` (Vite) – open daarna `http://localhost:4173`
 3. Plak een URL in de UI en druk op **Start scan**. Resultaten worden onderverdeeld per categorie en opgeslagen in de korte geschiedenis onder het formulier.
 
 ## Ethische richtlijnen

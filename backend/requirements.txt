@@ -3,5 +3,6 @@ beautifulsoup4
 fastapi
 uvicorn
 pydantic
+playwright
 
 # optioneel: cryptography (indien diepere TLS checks gewenst)

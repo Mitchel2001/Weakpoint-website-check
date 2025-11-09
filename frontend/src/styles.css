@@ -377,6 +377,111 @@ body {
   color: #475569;
 }
 
+.scan-inline-status {
+  margin-top: 1rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  background: #f8fafc;
+  padding: 1rem 1.25rem;
+}
+
+.scan-inline-status__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+}
+
+.scan-inline-status__header p {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #0f172a;
+}
+
+.scan-inline-status__header span {
+  font-variant-numeric: tabular-nums;
+  color: #1d4ed8;
+}
+
+.scan-inline-status__progress {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.08);
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+}
+
+.scan-inline-status__progress-value {
+  height: 100%;
+  background: linear-gradient(90deg, #4b6bfb, #8b5cf6, #f472b6);
+  border-radius: inherit;
+  width: 18%;
+  transition: width 0.4s ease;
+}
+
+.scan-inline-status__phase {
+  margin: 0;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.scan-inline-status__copy {
+  margin: 0.15rem 0 0.9rem;
+  color: #475569;
+  font-size: 0.92rem;
+}
+
+.scan-inline-status__count {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #1d4ed8;
+}
+
+.scan-inline-status__empty {
+  margin: 0;
+  padding: 0.5rem 0.65rem;
+  border-radius: 0.75rem;
+  background: rgba(15, 23, 42, 0.04);
+  color: #475569;
+  font-size: 0.9rem;
+}
+
+.scan-inline-status__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.scan-inline-status__list li {
+  padding: 0.55rem 0.65rem;
+  border-radius: 0.8rem;
+  border: 1px solid transparent;
+  background: #fff;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.scan-inline-status__list li.is-active {
+  border-color: rgba(59, 130, 246, 0.3);
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.scan-inline-status__url {
+  display: block;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.scan-inline-status__desc {
+  font-size: 0.8rem;
+  color: #475569;
+}
+
 @media (max-width: 720px) {
   .history li {
     grid-template-columns: 1fr;
@@ -388,5 +493,11 @@ body {
 
   .result-grid {
     grid-template-columns: 1fr;
+  }
+
+  .scan-inline-status__header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
   }
 }

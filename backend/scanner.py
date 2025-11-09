@@ -18,15 +18,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import socket
 import ssl
+import gzip
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -42,6 +44,47 @@ STATUS_INFO = "info"
 SEVERITY_CRITICAL = "critical"
 SEVERITY_IMPORTANT = "important"
 SEVERITY_NICE = "nice-to-have"
+
+DEFAULT_MAX_PAGES = 80
+DEFAULT_MAX_DEPTH = 4
+MAX_SEED_URLS = 120
+MAX_SITEMAP_URLS = 60
+MAX_ROBOTS_ALLOW_PATHS = 20
+MAX_REFLECTION_TESTS = 8
+REFLECTION_PARAM = "__weakpoint_probe"
+HEADLESS_TRIGGER_CODES = {401, 403, 406, 429, 451}
+HEADLESS_ENV_FLAG = os.getenv("WEAKPOINT_HEADLESS", "0") == "1"
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:  # pragma: no cover - optional dependency
+    sync_playwright = None
+
+HEADLESS_AVAILABLE = bool(sync_playwright and HEADLESS_ENV_FLAG)
+SITEMAP_GUESSES = [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemap1.xml",
+    "/sitemap-news.xml",
+]
+COMMON_CONTENT_PATHS = [
+    "/",
+    "/home",
+    "/index",
+    "/nieuws",
+    "/actueel",
+    "/over-ons",
+    "/overons",
+    "/contact",
+    "/diensten",
+    "/service",
+    "/blog",
+    "/cases",
+    "/projecten",
+    "/support",
+    "/privacy",
+    "/voorwaarden",
+]
 
 SECURITY_HEADERS = [
     "content-security-policy",
@@ -131,11 +174,22 @@ class ScanContext:
 def _safe_request(
     url: str, method: str = "GET", timeout: int = DEFAULT_TIMEOUT, **kwargs
 ) -> Optional[requests.Response]:
+    resp: Optional[requests.Response]
     try:
         resp = SESSION.request(method, url, timeout=timeout, **kwargs)
-        return resp
     except Exception:
-        return None
+        resp = None
+
+    should_try_headless = (
+        HEADLESS_AVAILABLE
+        and method.upper() == "GET"
+        and (resp is None or resp.status_code in HEADLESS_TRIGGER_CODES)
+    )
+    if should_try_headless:
+        fallback = _headless_request(url, timeout=timeout)
+        if fallback:
+            return fallback
+    return resp
 
 
 def _normalize_url(url: str) -> str:
@@ -147,6 +201,122 @@ def _normalize_url(url: str) -> str:
         path = path.rstrip("/") or "/"
     normalized = urlunparse((scheme, netloc, path, "", parsed.query, ""))
     return normalized
+
+
+def _append_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    query.append((key, value))
+    new_query = urlencode(query)
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path or "/",
+            parsed.params,
+            new_query,
+            parsed.fragment,
+        )
+    )
+
+
+def _normalize_hostname(host: Optional[str]) -> Optional[str]:
+    if not host:
+        return None
+    normalized = host.lower().rstrip(".")
+    if normalized.startswith("www."):
+        normalized = normalized[4:]
+    return normalized
+
+
+def _hosts_match(base_host: Optional[str], candidate_host: Optional[str]) -> bool:
+    base = _normalize_hostname(base_host)
+    candidate = _normalize_hostname(candidate_host)
+    if not base or not candidate:
+        return True
+    if candidate == base:
+        return True
+    return candidate.endswith(f".{base}")
+
+
+class HeadlessResponse:
+    def __init__(self, url: str, status_code: int, headers: Dict[str, str], html: str):
+        self.url = url
+        self.status_code = status_code
+        self.headers = headers
+        self._text = html
+        self.content = html.encode("utf-8", errors="ignore")
+        self.encoding = "utf-8"
+        self.history: List[Any] = []
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+
+def _headless_request(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[HeadlessResponse]:
+    if not HEADLESS_AVAILABLE:
+        return None
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = context.new_page()
+            try:
+                response = page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+                if response is None:
+                    return None
+                html = page.content()
+                headers = dict(response.headers())
+                final_url = page.url
+                status_code = response.status or 0
+                return HeadlessResponse(final_url, status_code, headers, html)
+            finally:
+                context.close()
+                browser.close()
+    except Exception:
+        return None
+
+
+def _notify_progress(
+    callback: Optional[Callable[[Dict[str, Any]], None]],
+    payload: Dict[str, Any],
+) -> None:
+    if not callback:
+        return
+    try:
+        callback(payload)
+    except Exception:
+        # Progress callbacks are best-effort only.
+        pass
+
+
+def _estimate_progress(count: int, budget: int, *, floor: float = 5.0, ceiling: float = 92.0) -> float:
+    if budget <= 0:
+        return floor
+    ratio = min(max(count / budget, 0.0), 1.0)
+    span = max(ceiling - floor, 1.0)
+    return round(floor + ratio * span, 2)
+
+
+def _read_limit_from_env(var_name: str, default: int, minimum: int) -> int:
+    value = os.getenv(var_name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(minimum, parsed)
+
+
+def _get_scan_limits() -> Tuple[int, int]:
+    max_pages = _read_limit_from_env("WEAKPOINT_MAX_PAGES", DEFAULT_MAX_PAGES, 8)
+    max_depth = _read_limit_from_env("WEAKPOINT_MAX_DEPTH", DEFAULT_MAX_DEPTH, 2)
+    return max_pages, max_depth
 
 
 def _is_html_response(resp: requests.Response) -> bool:
@@ -169,10 +339,188 @@ def _extract_links(
         parsed = urlparse(absolute)
         if parsed.scheme not in {"http", "https"}:
             continue
-        if base_host and parsed.hostname and parsed.hostname.lower() != base_host.lower():
+        if base_host and parsed.hostname and not _hosts_match(base_host, parsed.hostname):
             continue
         links.add(_normalize_url(absolute))
     return links
+
+
+def _extract_sitemaps_from_robots(robots_txt: str, base_root: str) -> List[str]:
+    urls: List[str] = []
+    for line in robots_txt.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lower = stripped.lower()
+        if lower.startswith("sitemap:"):
+            parts = stripped.split(":", 1)
+            if len(parts) < 2:
+                continue
+            candidate = parts[1].strip()
+            if not candidate:
+                continue
+            if candidate.startswith(("http://", "https://")):
+                urls.append(candidate)
+            elif candidate.startswith("/"):
+                urls.append(urljoin(base_root, candidate))
+    return urls
+
+
+def _extract_allowed_paths_from_robots(robots_txt: str, base_root: str) -> List[str]:
+    paths: List[str] = []
+    for line in robots_txt.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lower = stripped.lower()
+        if lower.startswith("allow:"):
+            parts = stripped.split(":", 1)
+            if len(parts) < 2:
+                continue
+            path = parts[1].strip()
+            if not path or not path.startswith("/"):
+                continue
+            paths.append(urljoin(base_root, path))
+            if len(paths) >= MAX_ROBOTS_ALLOW_PATHS:
+                break
+    return paths
+
+
+def _fetch_sitemap_document(url: str) -> Optional[str]:
+    resp = _safe_request(url, timeout=10)
+    if not resp or resp.status_code >= 400:
+        return None
+    content = resp.content
+    content_type = resp.headers.get("Content-Type", "").lower()
+    is_gzip = url.lower().endswith(".gz") or "gzip" in content_type
+    if is_gzip:
+        try:
+            content = gzip.decompress(content)
+        except OSError:
+            return None
+    encoding = resp.encoding or "utf-8"
+    try:
+        return content.decode(encoding, errors="ignore")
+    except Exception:
+        return content.decode("utf-8", errors="ignore")
+
+
+def _parse_sitemap_document(
+    xml_text: str, base_host: Optional[str]
+) -> Tuple[List[str], List[str]]:
+    try:
+        soup = BeautifulSoup(xml_text, "xml")
+    except Exception:
+        return [], []
+
+    page_urls: List[str] = []
+    nested_sitemaps: List[str] = []
+
+    for url_tag in soup.find_all("url"):
+        loc = url_tag.find("loc")
+        if not loc or not loc.text:
+            continue
+        candidate = loc.text.strip()
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if not _hosts_match(base_host, parsed.hostname):
+            continue
+        page_urls.append(_normalize_url(candidate))
+        if len(page_urls) >= MAX_SITEMAP_URLS:
+            break
+
+    for sitemap_tag in soup.find_all("sitemap"):
+        loc = sitemap_tag.find("loc")
+        if not loc or not loc.text:
+            continue
+        candidate = loc.text.strip()
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if not _hosts_match(base_host, parsed.hostname):
+            continue
+        nested_sitemaps.append(_normalize_url(candidate))
+
+    if not page_urls and not nested_sitemaps:
+        for loc in soup.find_all("loc"):
+            candidate = (loc.text or "").strip()
+            if not candidate:
+                continue
+            parsed = urlparse(candidate)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            if not _hosts_match(base_host, parsed.hostname):
+                continue
+            page_urls.append(_normalize_url(candidate))
+            if len(page_urls) >= MAX_SITEMAP_URLS:
+                break
+
+    return page_urls, nested_sitemaps
+
+
+def _collect_sitemap_pages(
+    base_root: str,
+    base_host: Optional[str],
+    robots_txt: Optional[str],
+    *,
+    max_sitemaps: int = 12,
+) -> List[str]:
+    targets: deque[str] = deque()
+    seen_targets: Set[str] = set()
+    collected_pages: List[str] = []
+
+    initial_targets = {urljoin(base_root, guess) for guess in SITEMAP_GUESSES}
+    if robots_txt:
+        initial_targets.update(_extract_sitemaps_from_robots(robots_txt, base_root))
+    for target in initial_targets:
+        targets.append(_normalize_url(target))
+
+    while targets and len(seen_targets) < max_sitemaps:
+        target = targets.popleft()
+        if not target or target in seen_targets:
+            continue
+        seen_targets.add(target)
+        xml_doc = _fetch_sitemap_document(target)
+        if not xml_doc:
+            continue
+        pages, nested = _parse_sitemap_document(xml_doc, base_host)
+        for page in pages:
+            if page not in collected_pages:
+                collected_pages.append(page)
+                if len(collected_pages) >= MAX_SITEMAP_URLS:
+                    return collected_pages
+        for nested_url in nested:
+            if nested_url not in seen_targets:
+                targets.append(nested_url)
+        if len(seen_targets) >= max_sitemaps:
+            break
+    return collected_pages
+
+
+def _build_seed_urls(
+    base_root: str,
+    base_host: Optional[str],
+    robots_txt: Optional[str],
+    sitemap_pages: List[str],
+) -> List[str]:
+    seeds: List[str] = [urljoin(base_root, path) for path in COMMON_CONTENT_PATHS]
+    seeds.extend(urljoin(base_root, path) for path in COMMON_LOGIN_PATHS)
+    if robots_txt:
+        seeds.extend(_extract_allowed_paths_from_robots(robots_txt, base_root))
+    seeds.extend(sitemap_pages)
+
+    unique: List[str] = []
+    seen: Set[str] = set()
+    for seed in seeds:
+        normalized = _normalize_url(seed)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+        if len(unique) >= MAX_SEED_URLS:
+            break
+    return unique
 
 
 def _snapshot_from_response(resp: requests.Response) -> PageSnapshot:
@@ -193,6 +541,8 @@ def _crawl_site(
     *,
     max_pages: int = 12,
     max_depth: int = 2,
+    seed_urls: Optional[Iterable[str]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[PageSnapshot]:
     base_parsed = urlparse(initial.url)
     base_host = base_parsed.hostname
@@ -210,16 +560,33 @@ def _crawl_site(
         parsed = urlparse(normalized)
         if parsed.scheme not in {"http", "https"}:
             return
-        if parsed.hostname and base_host and parsed.hostname.lower() != base_host.lower():
+        if parsed.hostname and base_host and not _hosts_match(base_host, parsed.hostname):
             return
         queued.add(normalized)
         queue.append((normalized, depth))
+
+    _notify_progress(
+        progress_callback,
+        {
+            "type": "page",
+            "url": initial.url,
+            "status_code": initial.status_code,
+            "depth": 0,
+            "count": len(snapshots),
+            "budget": max_pages,
+            "progress": _estimate_progress(len(snapshots), max_pages),
+        },
+    )
 
     for link in _extract_links(initial.soup, initial.url, base_host):
         enqueue(link, 1)
 
     for path in COMMON_LOGIN_PATHS:
         enqueue(urljoin(base_root, path), 1)
+
+    if seed_urls:
+        for seed in seed_urls:
+            enqueue(seed, 1)
 
     while queue and len(snapshots) < max_pages:
         candidate, depth = queue.popleft()
@@ -242,6 +609,18 @@ def _crawl_site(
         snapshot = _snapshot_from_response(resp)
         snapshots.append(snapshot)
         visited.add(normalized_final)
+        _notify_progress(
+            progress_callback,
+            {
+                "type": "page",
+                "url": snapshot.url,
+                "status_code": snapshot.status_code,
+                "depth": depth,
+                "count": len(snapshots),
+                "budget": max_pages,
+                "progress": _estimate_progress(len(snapshots), max_pages),
+            },
+        )
         if depth < max_depth:
             for link in _extract_links(snapshot.soup, snapshot.url, base_host):
                 enqueue(link, depth + 1)
@@ -873,6 +1252,67 @@ def _check_xss(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_reflection_probes(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    if not pages:
+        return _build_result(
+            id="xss_reflection_probe",
+            title="XSS reflectie test",
+            severity=SEVERITY_IMPORTANT,
+            status=STATUS_INFO,
+            summary="Geen pagina's beschikbaar voor reflectietest.",
+            remediation="Zorg dat de scan toegang heeft tot pagina's om te testen.",
+        )
+
+    sample_size = min(len(pages), MAX_REFLECTION_TESTS)
+    sampled_pages = random.sample(pages, sample_size)
+    findings: List[Dict[str, Any]] = []
+
+    for page in sampled_pages:
+        token = f"wp_reflect_{random.randint(10_000, 99_999)}"
+        probe_url = _append_query_param(page.url, REFLECTION_PARAM, token)
+        resp = _safe_request(probe_url, allow_redirects=True)
+        if not resp or resp.status_code >= 500:
+            continue
+        html = resp.text or ""
+        if token in html:
+            findings.append(
+                {
+                    "page": resp.url,
+                    "token": token,
+                    "status_code": resp.status_code,
+                }
+            )
+            if len(findings) >= MAX_REFLECTION_TESTS:
+                break
+
+    status = STATUS_FAIL if findings else STATUS_INFO
+    if findings:
+        summary = f"Ongefilterde reflectie gedetecteerd op {len(findings)} pagina's."
+        impact = "Een aanvaller kan invoer laten uitvoeren in de browser, wat tot accountovername kan leiden."
+    else:
+        summary = "Geen reflecties aangetroffen met testpayloads."
+        impact = "Invoer wordt vermoedelijk ontsmet of niet teruggestuurd, waardoor XSS minder waarschijnlijk is."
+
+    remediation = "Escape user input, gebruik templating zonder inline HTML en zet een strikte CSP in."
+    details = {
+        "tested_pages": sample_size,
+        "reflections": findings[:MAX_REFLECTION_TESTS],
+        "parameter": REFLECTION_PARAM,
+    }
+
+    return _build_result(
+        id="xss_reflection_probe",
+        title="XSS reflectie test",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
+    )
+
+
 def _check_sql_errors(context: ScanContext) -> CheckResult:
     pages = _iter_pages(context)
     patterns = [
@@ -1500,6 +1940,7 @@ CRITICAL_CHECKS = [
 
 IMPORTANT_CHECKS = [
     _check_xss,
+    _check_reflection_probes,
     _check_sql_errors,
     _check_auth_session,
     _check_server_versions,
@@ -1521,19 +1962,27 @@ NICE_CHECKS = [
 ]
 
 
-def run_scan(target_url: str) -> Dict[str, Any]:
+def run_scan(
+    target_url: str, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+) -> Dict[str, Any]:
+    _notify_progress(
+        progress_callback,
+        {"type": "phase", "phase": "warmup", "progress": 5},
+    )
     resp = _safe_request(target_url, allow_redirects=True)
     if resp is None:
         raise RuntimeError(f"Kan {target_url} niet bereiken.")
 
     html = resp.text or ""
     soup = BeautifulSoup(html, "html.parser")
-    base = f"{urlparse(resp.url).scheme}://{urlparse(resp.url).netloc}"
+    parsed_response = urlparse(resp.url)
+    base = f"{parsed_response.scheme}://{parsed_response.netloc}"
 
     robots_resp = _safe_request(urljoin(base, "/robots.txt"), timeout=6)
     robots_txt = robots_resp.text if robots_resp and robots_resp.status_code == 200 else None
-    sitemap_resp = _safe_request(urljoin(base, "/sitemap.xml"), method="HEAD", timeout=6)
-    sitemap_found = bool(sitemap_resp and sitemap_resp.status_code < 400)
+
+    sitemap_pages = _collect_sitemap_pages(base, parsed_response.hostname, robots_txt)
+    sitemap_found = bool(sitemap_pages)
 
     initial_page = PageSnapshot(
         url=resp.url,
@@ -1542,7 +1991,23 @@ def run_scan(target_url: str) -> Dict[str, Any]:
         soup=soup,
         headers={k: v for k, v in resp.headers.items()},
     )
-    crawled_pages = _crawl_site(initial_page, max_pages=16, max_depth=2)
+    seed_urls = _build_seed_urls(base, parsed_response.hostname, robots_txt, sitemap_pages)
+    max_pages, max_depth = _get_scan_limits()
+    _notify_progress(
+        progress_callback,
+        {"type": "phase", "phase": "crawl", "progress": 18},
+    )
+    crawled_pages = _crawl_site(
+        initial_page,
+        max_pages=max_pages,
+        max_depth=max_depth,
+        seed_urls=seed_urls,
+        progress_callback=progress_callback,
+    )
+    _notify_progress(
+        progress_callback,
+        {"type": "phase", "phase": "forms", "progress": 55},
+    )
 
     context = ScanContext(
         target_url=target_url,
@@ -1555,6 +2020,10 @@ def run_scan(target_url: str) -> Dict[str, Any]:
     )
 
     critical_results = [check(context) for check in CRITICAL_CHECKS]
+    _notify_progress(
+        progress_callback,
+        {"type": "phase", "phase": "security", "progress": 72},
+    )
     important_results = [check(context) for check in IMPORTANT_CHECKS]
     nice_results = [check(context) for check in NICE_CHECKS]
 
@@ -1564,6 +2033,10 @@ def run_scan(target_url: str) -> Dict[str, Any]:
             "important": important_results,
             "nice_to_have": nice_results,
         }
+    )
+    _notify_progress(
+        progress_callback,
+        {"type": "phase", "phase": "report", "progress": 88},
     )
 
     login_like_pages = [
@@ -1584,6 +2057,9 @@ def run_scan(target_url: str) -> Dict[str, Any]:
             "pages_scanned": len(crawled_pages),
             "sample_pages": [page.url for page in crawled_pages[:10]],
             "login_like_pages": login_like_pages[:10],
+            "max_pages_budget": max_pages,
+            "max_depth_budget": max_depth,
+            "seed_urls": seed_urls[:10],
         },
         "critical": [result.to_dict() for result in critical_results],
         "important": [result.to_dict() for result in important_results],

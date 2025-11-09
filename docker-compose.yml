@@ -7,6 +7,9 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    environment:
+      - WEAKPOINT_HEADLESS=1
+      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
     restart: unless-stopped
 
   frontend:
