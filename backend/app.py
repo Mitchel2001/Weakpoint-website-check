@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime, timezone
-from queue import Queue
+from queue import Empty, Queue
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -22,6 +22,9 @@ class ScanRequest(BaseModel):
         le=DEFAULT_MAX_PAGES,
         description="Maximaal aantal pagina's dat tijdens deze scan wordt bezocht.",
     )
+
+
+HEARTBEAT_INTERVAL_SECONDS = 20
 
 
 app = FastAPI(
@@ -97,7 +100,11 @@ def scan_stream(
 
     def event_stream():
         while True:
-            item = event_queue.get()
+            try:
+                item = event_queue.get(timeout=HEARTBEAT_INTERVAL_SECONDS)
+            except Empty:
+                yield 'data: {"type":"heartbeat"}\n\n'
+                continue
             if item is None:
                 break
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
