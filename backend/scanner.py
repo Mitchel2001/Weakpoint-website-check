@@ -180,6 +180,32 @@ DIRECTORY_LISTING_MARKERS = [
     "parent directory",
 ]
 
+SSRF_PARAMETER_NAMES = {
+    "url",
+    "target",
+    "redirect",
+    "dest",
+    "destination",
+    "next",
+    "callback",
+    "continue",
+    "return",
+    "returnurl",
+}
+
+INSECURE_DESIGN_HINTS = (
+    "debug mode",
+    "debug",
+    "staging",
+    "testomgeving",
+    "test mode",
+    "niet voor productie",
+    "not for production",
+    "internal only",
+    "demo data",
+    "placeholder",
+)
+
 SUBDOMAIN_GUESSES = [
     "www",
     "admin",
@@ -2648,6 +2674,114 @@ def _check_directory_listing(context: ScanContext) -> CheckResult:
     )
 
 
+def _check_ssrf_parameters(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    findings: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str, str]] = set()
+
+    def register(source: str, parameter: str, value: str, kind: str) -> None:
+        sample = value[:120] if value else ""
+        fingerprint = (source, parameter.lower(), sample, kind)
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        entry: Dict[str, Any] = {
+            "source": source,
+            "parameter": parameter,
+            "value_sample": sample,
+            "kind": kind,
+        }
+        if value and (value.startswith(("http://", "https://")) or "://" in value):
+            entry["external_candidate"] = True
+        findings.append(entry)
+
+    for page in pages:
+        parsed_page = urlparse(page.url)
+        for key, value in parse_qsl(parsed_page.query, keep_blank_values=False):
+            lowered = key.lower()
+            if lowered in SSRF_PARAMETER_NAMES:
+                register(page.url, key, value, "page_url")
+
+        for form in page.soup.find_all("form"):
+            action = urljoin(page.url, form.get("action") or page.url)
+            parsed_action = urlparse(action)
+            for key, value in parse_qsl(parsed_action.query, keep_blank_values=False):
+                lowered = key.lower()
+                if lowered in SSRF_PARAMETER_NAMES:
+                    register(action, key, value, "form_action")
+            for field in form.find_all(["input", "select"]):
+                name = (field.get("name") or "").strip()
+                if not name:
+                    continue
+                lowered = name.lower()
+                if lowered not in SSRF_PARAMETER_NAMES:
+                    continue
+                value = (field.get("value") or "").strip()
+                if value:
+                    register(page.url, name, value, "form_field")
+
+    status = STATUS_PASS if not findings else STATUS_INFO
+    summary = (
+        "Geen duidelijke SSRF/open redirect parameters aangetroffen."
+        if not findings
+        else f"{len(findings)} potentiële SSRF/open redirect parameters gevonden."
+    )
+    remediation = (
+        "Valideer en whitelist externe URL-parameters en splits redirect logica van server-side fetches."
+    )
+    impact = (
+        "Ongecontroleerde URL-parameters kunnen leiden tot SSRF of open redirects naar malafide domeinen."
+        if findings
+        else "Beperkte URL-parameters verkleinen de kans op SSRF of open redirect misbruik."
+    )
+
+    return _build_result(
+        id="ssrf_redirect_params",
+        title="SSRF & open redirect parameters",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details={"findings": findings[:12]} if findings else None,
+    )
+
+
+def _check_insecure_design_hints(context: ScanContext) -> CheckResult:
+    pages = _iter_pages(context)
+    matches: List[Dict[str, Any]] = []
+
+    for page in pages:
+        text = page.html.lower()
+        hits = sorted({hint for hint in INSECURE_DESIGN_HINTS if hint in text})
+        if hits:
+            matches.append({"page": page.url, "hints": hits})
+
+    status = STATUS_PASS if not matches else STATUS_INFO
+    summary = (
+        "Geen debug/test aanwijzingen gevonden."
+        if not matches
+        else f"Debug/test aanwijzingen op {len(matches)} pagina('s)."
+    )
+    remediation = "Verwijder debug/test content uit productie en beperk toegang tot interne tooling."
+    impact = (
+        "Debug teksten kunnen gevoelige info prijsgeven of duiden op onvoldoende hardening."
+        if matches
+        else "Het ontbreken van debug hints verkleint de kans op informatielekken."
+    )
+
+    return _build_result(
+        id="insecure_design_hints",
+        title="Debug/test artefacten",
+        severity=SEVERITY_IMPORTANT,
+        status=status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details={"matches": matches[:12]} if matches else None,
+    )
+
+
 def _check_outdated_js_libraries(context: ScanContext) -> CheckResult:
     pages = _iter_pages(context)
     outdated: List[Dict[str, Any]] = []
@@ -3313,12 +3447,14 @@ IMPORTANT_CHECKS = [
     _check_server_versions,
     _check_backup_files,
     _check_supply_chain,
+    _check_ssrf_parameters,
     _check_directory_listing,
     _check_outdated_js_libraries,
     _check_file_uploads,
     _check_business_logic,
     _check_rate_limiting,
     _check_error_handling,
+    _check_insecure_design_hints,
     _check_graphql_introspection,
     _check_http_methods,
     _check_security_txt,
