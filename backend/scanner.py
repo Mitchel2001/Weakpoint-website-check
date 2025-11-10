@@ -17,20 +17,26 @@ to avoid unnecessary load on the target.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import logging
 import os
 import random
 import re
 import socket
 import ssl
+import threading
 import gzip
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from http.cookies import SimpleCookie
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
+from requests.cookies import RequestsCookieJar, merge_cookies
 from bs4 import BeautifulSoup
 
 DEFAULT_TIMEOUT = 12
@@ -48,6 +54,7 @@ SEVERITY_NICE = "nice-to-have"
 DEFAULT_MAX_PAGES = 150
 DEFAULT_PAGE_BUDGET = 50
 DEFAULT_MAX_DEPTH = 4
+DEFAULT_CRAWLER_WORKERS = 4
 MAX_SEED_URLS = 120
 MAX_SITEMAP_URLS = 60
 MAX_ROBOTS_ALLOW_PATHS = 20
@@ -87,6 +94,8 @@ PENTEST_PAYLOADS = [
         "template": "{{7*7}}weakpoint-{token}",
     },
 ]
+
+CSRF_FIELD_HINTS = ("csrf", "xsrf", "token", "authenticity", "verification")
 
 try:
     from playwright.sync_api import sync_playwright
@@ -276,6 +285,12 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
 
 
+logger = logging.getLogger("weakpoint.scanner")
+logger.addHandler(logging.NullHandler())
+
+_THREAD_LOCAL_SESSION: threading.local = threading.local()
+
+
 def _load_auth_configuration() -> Dict[str, Any]:
     config: Dict[str, Any] = {}
     bearer = os.getenv("WEAKPOINT_AUTH_BEARER")
@@ -355,13 +370,71 @@ class ScanContext:
         return urlparse(self.response.url)
 
 
+def _clone_cookies(source: RequestsCookieJar) -> RequestsCookieJar:
+    jar = RequestsCookieJar()
+    for cookie in source:
+        jar.set(
+            cookie.name,
+            cookie.value,
+            domain=cookie.domain,
+            path=cookie.path,
+            secure=cookie.secure,
+            rest=getattr(cookie, "_rest", {}),
+        )
+    return jar
+
+
+def _get_thread_session() -> requests.Session:
+    session = getattr(_THREAD_LOCAL_SESSION, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(SESSION.headers)
+        session.cookies.update(SESSION.cookies)
+        setattr(_THREAD_LOCAL_SESSION, "session", session)
+    return session
+
+
 def _safe_request(
     url: str, method: str = "GET", timeout: int = DEFAULT_TIMEOUT, **kwargs
 ) -> Optional[requests.Response]:
+    request_kwargs = dict(kwargs)
+    extra_headers = request_kwargs.pop("headers", None)
+    extra_cookies = request_kwargs.pop("cookies", None)
+
+    session = _get_thread_session()
+    headers = dict(session.headers)
+    if extra_headers:
+        headers.update(extra_headers)
+
     resp: Optional[requests.Response]
     try:
-        resp = SESSION.request(method, url, timeout=timeout, **kwargs)
-    except Exception:
+        if extra_cookies is not None:
+            try:
+                merged_cookies = merge_cookies(
+                    _clone_cookies(session.cookies), extra_cookies
+                )
+            except Exception:
+                merged_cookies = merge_cookies(RequestsCookieJar(), extra_cookies)
+            request_kwargs["cookies"] = merged_cookies
+
+        resp = session.request(
+            method,
+            url,
+            timeout=timeout,
+            headers=headers,
+            **request_kwargs,
+        )
+    except requests.RequestException as exc:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.exception("Request %s %s failed", method.upper(), url)
+        else:
+            logger.warning("Request %s %s failed: %s", method.upper(), url, exc)
+        resp = None
+    except Exception as exc:  # pragma: no cover - defensive
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.exception("Unexpected error during request %s %s", method.upper(), url)
+        else:
+            logger.error("Unexpected error during request %s %s: %s", method.upper(), url, exc)
         resp = None
 
     should_try_headless = (
@@ -372,6 +445,9 @@ def _safe_request(
     if should_try_headless:
         fallback = _headless_request(url, timeout=timeout)
         if fallback:
+            logger.info(
+                "Headless fallback succeeded for %s %s after initial failure", method.upper(), url
+            )
             return fallback
     return resp
 
@@ -805,6 +881,10 @@ def _crawl_site(
     visited: Set[str] = {_normalize_url(initial.url)}
     queued: Set[str] = set()
     queue: deque[Tuple[str, int]] = deque()
+    in_flight: Dict[Any, Tuple[str, int]] = {}
+    max_workers = _read_limit_from_env(
+        "WEAKPOINT_CRAWLER_WORKERS", DEFAULT_CRAWLER_WORKERS, 1
+    )
 
     def enqueue(candidate: str, depth: int) -> None:
         normalized = _normalize_url(candidate)
@@ -841,48 +921,81 @@ def _crawl_site(
         for seed in seed_urls:
             enqueue(seed, 1)
 
-    while queue and len(snapshots) < max_pages:
-        candidate, depth = queue.popleft()
-        queued.discard(candidate)
-        if candidate in visited:
-            continue
-        resp = _safe_request(candidate, allow_redirects=True)
-        if resp is None:
-            visited.add(candidate)
-            continue
-        normalized_final = _normalize_url(resp.url)
-        if normalized_final in visited:
-            visited.add(candidate)
-            continue
-        if resp.status_code >= 500:
-            visited.add(normalized_final)
-            visited.add(candidate)
-            continue
-        if not _is_html_response(resp):
-            visited.add(normalized_final)
-            visited.add(candidate)
-            continue
-        snapshot = _snapshot_from_response(resp)
-        snapshots.append(snapshot)
-        visited.add(candidate)
-        visited.add(normalized_final)
-        _notify_progress(
-            progress_callback,
-            {
-                "type": "page",
-                "url": snapshot.url,
-                "status_code": snapshot.status_code,
-                "depth": depth,
-                "count": len(snapshots),
-                "budget": max_pages,
-                "progress": _estimate_progress(len(snapshots), max_pages),
-            },
-        )
-        if depth < max_depth:
-            for link in _extract_links(snapshot.soup, snapshot.url, base_host):
-                enqueue(link, depth + 1)
-        if len(snapshots) >= max_pages:
-            break
+    budget_exhausted = False
+
+    def _schedule_from_queue(executor: ThreadPoolExecutor) -> None:
+        while (
+            not budget_exhausted
+            and queue
+            and len(in_flight) < max_workers
+        ):
+            candidate, depth = queue.popleft()
+            queued.discard(candidate)
+            if candidate in visited:
+                continue
+            future = executor.submit(_safe_request, candidate, allow_redirects=True)
+            in_flight[future] = (candidate, depth)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        _schedule_from_queue(executor)
+
+        while in_flight or queue:
+            if not in_flight:
+                _schedule_from_queue(executor)
+                if not in_flight:
+                    break
+
+            done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+            for future in done:
+                candidate, depth = in_flight.pop(future)
+                try:
+                    resp = future.result()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.error("Crawler worker failed for %s: %s", candidate, exc)
+                    resp = None
+
+                visited.add(candidate)
+                if resp is None or budget_exhausted:
+                    continue
+
+                normalized_final = _normalize_url(resp.url)
+                if normalized_final in visited:
+                    visited.add(normalized_final)
+                    continue
+                if resp.status_code >= 500 or not _is_html_response(resp):
+                    visited.add(normalized_final)
+                    continue
+
+                snapshot = _snapshot_from_response(resp)
+                snapshots.append(snapshot)
+                visited.add(normalized_final)
+                _notify_progress(
+                    progress_callback,
+                    {
+                        "type": "page",
+                        "url": snapshot.url,
+                        "status_code": snapshot.status_code,
+                        "depth": depth,
+                        "count": len(snapshots),
+                        "budget": max_pages,
+                        "progress": _estimate_progress(len(snapshots), max_pages),
+                    },
+                )
+                if depth < max_depth:
+                    for link in _extract_links(snapshot.soup, snapshot.url, base_host):
+                        enqueue(link, depth + 1)
+
+                if len(snapshots) >= max_pages:
+                    budget_exhausted = True
+                    break
+
+            if budget_exhausted:
+                # Drain remaining futures without processing new pages.
+                for future in list(in_flight.keys()):
+                    in_flight.pop(future, None)
+                break
+
+            _schedule_from_queue(executor)
 
     unique_snapshots: Dict[str, PageSnapshot] = {}
     for snap in snapshots:
@@ -907,23 +1020,50 @@ def _iter_pages(context: ScanContext) -> List[PageSnapshot]:
 
 
 def _extract_cookies(resp: requests.Response) -> List[Dict[str, Any]]:
-    cookies = []
-    header = resp.headers.get("Set-Cookie")
-    if not header:
-        return cookies
-    raw_cookies = [c.strip() for c in header.split(", ")]
-    for raw in raw_cookies:
-        parts = raw.split(";")
-        attrs: Dict[str, Any] = {"name": parts[0].strip()}
-        for attr in parts[1:]:
-            attr = attr.strip()
-            if "=" in attr:
-                key, value = attr.split("=", 1)
-                attrs[key.lower()] = value
-            else:
-                attrs[attr.lower()] = True
-        cookies.append(attrs)
-    return cookies
+    parsed: List[Dict[str, Any]] = []
+
+    header_values: List[str] = []
+    raw_headers = getattr(resp, "raw", None)
+    if raw_headers and hasattr(raw_headers, "headers"):
+        header_source = raw_headers.headers
+        getter = getattr(header_source, "getlist", None) or getattr(
+            header_source, "get_all", None
+        )
+        if getter:
+            try:
+                header_values.extend(getter("Set-Cookie") or [])
+            except Exception:
+                pass
+
+    if not header_values:
+        header = resp.headers.get("Set-Cookie")
+        if header:
+            header_values.append(header)
+
+    for header in header_values:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(header)
+        except Exception:
+            logger.debug("Kon Set-Cookie header niet parsen: %s", header)
+            continue
+        for morsel in cookie.values():
+            payload: Dict[str, Any] = {
+                "name": morsel.key,
+                "value": morsel.value,
+            }
+            for key in morsel.keys():
+                value = morsel[key]
+                if isinstance(value, str) and not value:
+                    value = None
+                if key == "secure" or key == "httponly":
+                    payload[key] = bool(value)
+                elif key in {"max-age"}:
+                    payload[key.replace("-", "_")] = value
+                else:
+                    payload[key] = value
+            parsed.append(payload)
+    return parsed
 
 
 def _build_result(
@@ -947,6 +1087,36 @@ def _build_result(
         impact=impact,
         details=details,
     )
+
+
+def _looks_like_csrf_field(tag: Any) -> bool:
+    if not hasattr(tag, "get"):
+        return False
+    candidates = [
+        (tag.get("name") or "").lower(),
+        (tag.get("id") or "").lower(),
+    ]
+    classes = tag.get("class")
+    if isinstance(classes, (list, tuple)):
+        candidates.extend(cls.lower() for cls in classes if isinstance(cls, str))
+    elif isinstance(classes, str):
+        candidates.extend(part.lower() for part in classes.split())
+    for candidate in candidates:
+        if any(hint in candidate for hint in CSRF_FIELD_HINTS):
+            return True
+    return False
+
+
+def _form_has_csrf_token(form: Any) -> bool:
+    if not hasattr(form, "find_all"):
+        return False
+    for field in form.find_all("input"):
+        input_type = (field.get("type") or "").lower()
+        if input_type in {"submit", "button", "image", "reset"}:
+            continue
+        if _looks_like_csrf_field(field):
+            return True
+    return False
 
 
 def _check_tls(context: ScanContext) -> CheckResult:
@@ -2084,9 +2254,11 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
             "sanitized": [],
             "sql_errors": [],
             "executed": [],
+            "dom_reflections": [],
             "blocked": [],
         }
     tested = 0
+    forms_missing_csrf: List[Dict[str, Any]] = []
 
     for page in pages:
         if tested >= PENTEST_FORM_LIMIT:
@@ -2119,6 +2291,16 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
                 continue
 
             tested += 1
+            has_csrf = _form_has_csrf_token(form)
+            if method == "post" and not has_csrf:
+                forms_missing_csrf.append(
+                    {
+                        "page": page.url,
+                        "target": target,
+                        "form_index": idx,
+                        "reason": "missing_csrf",
+                    }
+                )
             for payload in PENTEST_PAYLOADS:
                 payload_id = payload["id"]
                 marker = f"{seed_token}-{payload_id}-{tested}"
@@ -2149,6 +2331,13 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
                 text = resp.text or ""
                 lowered = text.lower()
                 marker_lower = marker.lower()
+                headless_text = ""
+                headless_lower = ""
+                if HEADLESS_AVAILABLE and method == "get":
+                    headless_resp = _headless_request(resp.url, timeout=DEFAULT_TIMEOUT)
+                    if headless_resp:
+                        headless_text = headless_resp.text or ""
+                        headless_lower = headless_text.lower()
 
                 if payload_id == "xss":
                     raw_marker = f"<weakpoint-{marker}>"
@@ -2169,6 +2358,26 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
                                     "target": target,
                                     "form_index": idx,
                                     "status_code": resp.status_code,
+                                }
+                            )
+                    elif headless_text:
+                        if raw_marker in headless_text:
+                            result_bucket["dom_reflections"].append(
+                                {
+                                    "page": page.url,
+                                    "target": resp.url,
+                                    "form_index": idx,
+                                    "status_code": resp.status_code,
+                                }
+                            )
+                        elif f"weakpoint-{marker_lower}" in headless_lower:
+                            result_bucket["dom_reflections"].append(
+                                {
+                                    "page": page.url,
+                                    "target": resp.url,
+                                    "form_index": idx,
+                                    "status_code": resp.status_code,
+                                    "context": "encoded",
                                 }
                             )
                 elif payload_id == "sql":
@@ -2214,9 +2423,15 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
     fail_messages: List[str] = []
     total_blocked = 0
     for payload_id, result in payload_results.items():
-        if result["reflections"] or result["sql_errors"] or result["executed"]:
+        total_hits = (
+            len(result["reflections"])
+            + len(result["sql_errors"])
+            + len(result["executed"])
+            + len(result["dom_reflections"])
+        )
+        if total_hits:
             fail_messages.append(
-                f"{result['label']}: {len(result['reflections']) + len(result['sql_errors']) + len(result['executed'])} treffers"
+                f"{result['label']}: {total_hits} treffers"
             )
         total_blocked += len(result["blocked"])
 
@@ -2238,6 +2453,11 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
         impact = (
             "Blokkade wijst op tegenmaatregelen, maar handmatige review blijft nodig om ev. bypasses uit te sluiten."
         )
+    elif forms_missing_csrf:
+        status = STATUS_WARN
+        summary = f"{len(forms_missing_csrf)} formulier(en) zonder CSRF-token gevonden."
+        remediation = "Voeg unieke CSRF-tokens toe aan POST formulieren en valideer ze server-side."
+        impact = "Zonder CSRF-tokens kunnen aanvallers authenticatie misbruiken voor cross-site request forgery."
 
     details_payloads = {
         payload_id: {
@@ -2247,6 +2467,7 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
             "sanitized": result["sanitized"][:10],
             "sql_errors": result["sql_errors"][:10],
             "executed": result["executed"][:10],
+            "dom_reflections": result["dom_reflections"][:10],
             "blocked": result["blocked"][:10],
         }
         for payload_id, result in payload_results.items()
@@ -2255,6 +2476,7 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
     details: Dict[str, Any] = {
         "tested_forms": tested,
         "payloads": details_payloads,
+        "forms_missing_csrf": forms_missing_csrf[:10],
     }
 
     return _build_result(
@@ -3424,55 +3646,165 @@ def _calculate_score(groups: Dict[str, List[CheckResult]]) -> Dict[str, Any]:
     return payload
 
 
-CRITICAL_CHECKS = [
-    _check_tls,
-    _check_dns_surface,
-    _check_security_headers,
-    _check_csp_strength,
-    _check_cache_control,
-    _check_mixed_content,
-    _check_redirects_and_canonical,
-    _check_cors,
-    _check_cookies,
-    _check_forms,
-]
+@dataclass
+class RegisteredCheck:
+    name: str
+    func: Callable[[ScanContext], CheckResult]
+    source: str = "core"
 
-IMPORTANT_CHECKS = [
-    _check_api_surface,
-    _check_xss,
-    _check_reflection_probes,
-    _check_sql_errors,
-    _check_auth_session,
-    _check_access_control,
-    _check_server_versions,
-    _check_backup_files,
-    _check_supply_chain,
-    _check_ssrf_parameters,
-    _check_directory_listing,
-    _check_outdated_js_libraries,
-    _check_file_uploads,
-    _check_business_logic,
-    _check_rate_limiting,
-    _check_error_handling,
-    _check_insecure_design_hints,
-    _check_graphql_introspection,
-    _check_http_methods,
-    _check_security_txt,
-    _check_sri,
-]
 
-PENTEST_CHECKS = [
-    _check_active_form_attacks,
-]
+class CheckRegistry:
+    def __init__(self) -> None:
+        self._categories: Dict[str, List[RegisteredCheck]] = {
+            "critical": [],
+            "important": [],
+            "pentest": [],
+            "nice_to_have": [],
+        }
+        self._lock = threading.RLock()
 
-NICE_CHECKS = [
-    _check_performance,
-    _check_accessibility,
-    _check_seo,
-    _check_mobile,
-    _check_third_party,
-    _check_privacy,
-]
+    def register(self, category: str, func: Callable[[ScanContext], CheckResult], *, source: str = "core") -> None:
+        if category not in self._categories:
+            raise ValueError(f"Onbekende check-categorie: {category}")
+        entry = RegisteredCheck(name=getattr(func, "__name__", repr(func)), func=func, source=source)
+        with self._lock:
+            self._categories[category].append(entry)
+
+    def register_many(
+        self,
+        category: str,
+        funcs: Iterable[Callable[[ScanContext], CheckResult]],
+        *,
+        source: str = "core",
+    ) -> None:
+        for func in funcs:
+            self.register(category, func, source=source)
+
+    def iter_checks(
+        self, category: str, *, disabled: Optional[Set[str]] = None
+    ) -> Iterable[Callable[[ScanContext], CheckResult]]:
+        disabled_lookup = {name.lower() for name in (disabled or set())}
+        with self._lock:
+            entries = list(self._categories.get(category, []))
+        for entry in entries:
+            if entry.name.lower() in disabled_lookup:
+                continue
+            yield entry.func
+
+    def describe(self, *, disabled: Optional[Set[str]] = None) -> Dict[str, List[Dict[str, Any]]]:
+        disabled_lookup = {name.lower() for name in (disabled or set())}
+        snapshot: Dict[str, List[RegisteredCheck]]
+        with self._lock:
+            snapshot = {key: list(value) for key, value in self._categories.items()}
+        description: Dict[str, List[Dict[str, Any]]] = {}
+        for category, entries in snapshot.items():
+            description[category] = [
+                {
+                    "name": entry.name,
+                    "source": entry.source,
+                    "enabled": entry.name.lower() not in disabled_lookup,
+                }
+                for entry in entries
+            ]
+        return description
+
+
+CHECK_REGISTRY = CheckRegistry()
+
+
+def register_check(category: str, func: Callable[[ScanContext], CheckResult], *, source: str = "plugin") -> None:
+    CHECK_REGISTRY.register(category, func, source=source)
+
+
+def _resolve_disabled_checks() -> Set[str]:
+    raw = os.getenv("WEAKPOINT_DISABLE_CHECKS")
+    if not raw:
+        return set()
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _load_check_plugins() -> None:
+    plugin_spec = os.getenv("WEAKPOINT_PLUGINS")
+    if not plugin_spec:
+        return
+    for module_name in plugin_spec.split(","):
+        name = module_name.strip()
+        if not name:
+            continue
+        try:
+            importlib.import_module(name)
+            logger.info("Pluginmodule geladen: %s", name)
+        except Exception as exc:
+            logger.error("Kon plugin %s niet laden: %s", name, exc)
+
+
+_PLUGINS_INITIALIZED = False
+
+
+def _ensure_plugins_loaded() -> None:
+    global _PLUGINS_INITIALIZED
+    if _PLUGINS_INITIALIZED:
+        return
+    _load_check_plugins()
+    _PLUGINS_INITIALIZED = True
+
+
+CHECK_REGISTRY.register_many(
+    "critical",
+    [
+        _check_tls,
+        _check_dns_surface,
+        _check_security_headers,
+        _check_csp_strength,
+        _check_cache_control,
+        _check_mixed_content,
+        _check_redirects_and_canonical,
+        _check_cors,
+        _check_cookies,
+        _check_forms,
+    ],
+)
+
+CHECK_REGISTRY.register_many(
+    "important",
+    [
+        _check_api_surface,
+        _check_xss,
+        _check_reflection_probes,
+        _check_sql_errors,
+        _check_auth_session,
+        _check_access_control,
+        _check_server_versions,
+        _check_backup_files,
+        _check_supply_chain,
+        _check_ssrf_parameters,
+        _check_directory_listing,
+        _check_outdated_js_libraries,
+        _check_file_uploads,
+        _check_business_logic,
+        _check_rate_limiting,
+        _check_error_handling,
+        _check_insecure_design_hints,
+        _check_graphql_introspection,
+        _check_http_methods,
+        _check_security_txt,
+        _check_sri,
+    ],
+)
+
+CHECK_REGISTRY.register("pentest", _check_active_form_attacks)
+
+CHECK_REGISTRY.register_many(
+    "nice_to_have",
+    [
+        _check_performance,
+        _check_accessibility,
+        _check_seo,
+        _check_mobile,
+        _check_third_party,
+        _check_privacy,
+    ],
+)
 
 
 def run_scan(
@@ -3535,18 +3867,29 @@ def run_scan(
         auth=AUTH_CONTEXT,
     )
 
-    critical_results = [check(context) for check in CRITICAL_CHECKS]
+    _ensure_plugins_loaded()
+    disabled_checks = _resolve_disabled_checks()
+    active_checks = {
+        "critical": list(CHECK_REGISTRY.iter_checks("critical", disabled=disabled_checks)),
+        "important": list(CHECK_REGISTRY.iter_checks("important", disabled=disabled_checks)),
+        "pentest": list(CHECK_REGISTRY.iter_checks("pentest", disabled=disabled_checks)),
+        "nice_to_have": list(
+            CHECK_REGISTRY.iter_checks("nice_to_have", disabled=disabled_checks)
+        ),
+    }
+
+    critical_results = [check(context) for check in active_checks["critical"]]
     _notify_progress(
         progress_callback,
         {"type": "phase", "phase": "security", "progress": 72},
     )
-    important_results = [check(context) for check in IMPORTANT_CHECKS]
+    important_results = [check(context) for check in active_checks["important"]]
     _notify_progress(
         progress_callback,
         {"type": "phase", "phase": "pentest", "progress": 80},
     )
-    pentest_results = [check(context) for check in PENTEST_CHECKS]
-    nice_results = [check(context) for check in NICE_CHECKS]
+    pentest_results = [check(context) for check in active_checks["pentest"]]
+    nice_results = [check(context) for check in active_checks["nice_to_have"]]
 
     score = _calculate_score(
         {
@@ -3583,6 +3926,10 @@ def run_scan(
             "max_depth_budget": max_depth,
             "seed_urls": seed_urls[:10],
             "auth_mode": AUTH_CONTEXT,
+            "checks": {
+                "disabled": sorted(disabled_checks),
+                "registered": CHECK_REGISTRY.describe(disabled=disabled_checks),
+            },
         },
         "critical": [result.to_dict() for result in critical_results],
         "important": [result.to_dict() for result in important_results],
