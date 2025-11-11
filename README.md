@@ -62,9 +62,11 @@ Gebruik `--max-pages` om tijdelijk een andere limiet af te dwingen; laat de vlag
 
 ### Pagina-limieten en defaults
 
-- De frontend bevat een schuif (20-150 pagina's) met standaardwaarde 50 zodat grote sites direct resultaat geven zonder dat de crawler vastloopt.
+- De frontend bevat een schuif (20-500 pagina's) met standaardwaarde 50 zodat grote sites direct resultaat geven zonder dat de crawler vastloopt.
 - Zowel de API-body als de stream-endpoint accepteren `max_pages`; laat de parameter weg om de standaard 50 pagina's te gebruiken.
-- `WEAKPOINT_MAX_PAGES` is het harde backend-maximum (default 150). Zet je deze lager, dan clampen API en UI de waarde automatisch.
+- `WEAKPOINT_MAX_PAGES` is het harde backend-maximum (default 500). Zet je deze lager, dan clampen API en UI de waarde automatisch.
+- Het aantal seed-URL's en sitemap-entries schaalt mee met je gekozen budget. Wil je het absoluut begrenzen, gebruik dan `WEAKPOINT_MAX_SEED_URLS` en/of `WEAKPOINT_MAX_SITEMAP_URLS`.
+- De ingestelde limiet is een bovengrens: als een scan minder pagina's oplevert betekent dat dat er minder unieke HTML-pagina's bereikbaar zijn via statische links, robots.txt of sitemaps (denk aan JS-routes of logins).
 
 Voorbeeld responsefragment:
 

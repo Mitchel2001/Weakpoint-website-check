@@ -22,7 +22,7 @@ const SCAN_PHASES = [
 
 const PAGE_LIMITS = {
   min: 20,
-  max: 150,
+  max: 500,
   step: 10,
   default: 50
 };
@@ -126,6 +126,9 @@ export default function App() {
     eventSourceRef.current = stream;
 
     stream.onmessage = (messageEvent) => {
+      if (eventSourceRef.current !== stream) {
+        return;
+      }
       try {
         const payload = JSON.parse(messageEvent.data);
         if (payload.type === 'page') {
@@ -184,6 +187,9 @@ export default function App() {
     };
 
     stream.onerror = () => {
+      if (eventSourceRef.current !== stream) {
+        return;
+      }
       setError('Verbinding met scanservice verbroken.');
       setLoading(false);
       setActiveBudget(maxPagesBudget);
@@ -193,6 +199,9 @@ export default function App() {
   };
 
   const meta = report?.meta;
+  const crawlUnderBudget = Boolean(
+    meta?.max_pages_budget && meta?.pages_scanned < meta.max_pages_budget
+  );
 
   const summaryStats = useMemo(() => {
     if (!report) return null;
@@ -261,11 +270,11 @@ export default function App() {
                 disabled={loading}
               />
               <div className="page-budget__ticks">
-                <span>Snelle scan (tot 50)</span>
-                <span>Volledige scan (tot 150)</span>
+                <span>Snelle scan (tot {PAGE_LIMITS.default})</span>
+                <span>Diepe scan (tot {PAGE_LIMITS.max})</span>
               </div>
               <p className="page-budget__hint">
-                Standaard beperken we de crawler tot 50 pagina&apos;s zodat hij niet vastloopt. Verhoog alleen voor grotere sites.
+                Standaard beperken we de crawler tot {PAGE_LIMITS.default} pagina&apos;s zodat hij niet vastloopt. Verhoog alleen voor grotere sites of diepere analyses (max {PAGE_LIMITS.max}).
               </p>
             </div>
           </form>
@@ -331,6 +340,14 @@ export default function App() {
                 <p className="value">{meta.max_pages_budget}</p>
               </div>
             </div>
+          )}
+          {crawlUnderBudget && meta && (
+            <p className="info-message">
+              We vroegen {meta.max_pages_budget} pagina&apos;s maar vonden er {meta.pages_scanned}. Dit betekent meestal dat
+              slechts een deel van de site via statische links of een sitemap bereikbaar is (bijvoorbeeld door
+              JavaScript-navigatie, robots.txt of login). Controleer de sitemap of verhoog tijdelijk de crawler-diepte
+              (WEAKPOINT_MAX_DEPTH) als je meer routes wilt proberen.
+            </p>
           )}
           {score && summaryStats && (
             <ScoreSummary score={score} sections={SECTIONS} sectionStats={summaryStats} />

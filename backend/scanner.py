@@ -51,12 +51,14 @@ SEVERITY_CRITICAL = "critical"
 SEVERITY_IMPORTANT = "important"
 SEVERITY_NICE = "nice-to-have"
 
-DEFAULT_MAX_PAGES = 150
+DEFAULT_MAX_PAGES = 500
 DEFAULT_PAGE_BUDGET = 50
 DEFAULT_MAX_DEPTH = 4
 DEFAULT_CRAWLER_WORKERS = 4
-MAX_SEED_URLS = 120
-MAX_SITEMAP_URLS = 60
+DEFAULT_MAX_SEED_URLS = 120
+DEFAULT_MAX_SITEMAP_URLS = 60
+HARD_MAX_SEED_URLS = 900
+HARD_MAX_SITEMAP_URLS = 1500
 MAX_ROBOTS_ALLOW_PATHS = 20
 MAX_REFLECTION_TESTS = 8
 HTTP_METHOD_ENDPOINT_LIMIT = 6
@@ -648,6 +650,26 @@ def _get_scan_limits(user_max_pages: Optional[int] = None) -> Tuple[int, int]:
     return max_pages, max_depth
 
 
+def _resolve_seed_limit(page_budget: int) -> int:
+    hard_cap = _read_limit_from_env(
+        "WEAKPOINT_MAX_SEED_URLS",
+        HARD_MAX_SEED_URLS,
+        DEFAULT_MAX_SEED_URLS,
+    )
+    target = max(DEFAULT_MAX_SEED_URLS, int(page_budget * 1.2))
+    return min(hard_cap, target)
+
+
+def _resolve_sitemap_limit(page_budget: int) -> int:
+    hard_cap = _read_limit_from_env(
+        "WEAKPOINT_MAX_SITEMAP_URLS",
+        HARD_MAX_SITEMAP_URLS,
+        DEFAULT_MAX_SITEMAP_URLS,
+    )
+    target = max(DEFAULT_MAX_SITEMAP_URLS, int(page_budget * 1.5))
+    return min(hard_cap, target)
+
+
 def _is_html_response(resp: requests.Response) -> bool:
     content_type = resp.headers.get("Content-Type", "").lower()
     return "html" in content_type or "xml" in content_type or not content_type
@@ -735,7 +757,7 @@ def _fetch_sitemap_document(url: str) -> Optional[str]:
 
 
 def _parse_sitemap_document(
-    xml_text: str, base_host: Optional[str]
+    xml_text: str, base_host: Optional[str], limit: int
 ) -> Tuple[List[str], List[str]]:
     try:
         soup = BeautifulSoup(xml_text, "xml")
@@ -756,7 +778,7 @@ def _parse_sitemap_document(
         if not _hosts_match(base_host, parsed.hostname):
             continue
         page_urls.append(_normalize_url(candidate))
-        if len(page_urls) >= MAX_SITEMAP_URLS:
+        if len(page_urls) >= limit:
             break
 
     for sitemap_tag in soup.find_all("sitemap"):
@@ -769,7 +791,7 @@ def _parse_sitemap_document(
             continue
         if not _hosts_match(base_host, parsed.hostname):
             continue
-        nested_sitemaps.append(_normalize_url(candidate))
+            nested_sitemaps.append(_normalize_url(candidate))
 
     if not page_urls and not nested_sitemaps:
         for loc in soup.find_all("loc"):
@@ -782,7 +804,7 @@ def _parse_sitemap_document(
             if not _hosts_match(base_host, parsed.hostname):
                 continue
             page_urls.append(_normalize_url(candidate))
-            if len(page_urls) >= MAX_SITEMAP_URLS:
+            if len(page_urls) >= limit:
                 break
 
     return page_urls, nested_sitemaps
@@ -794,6 +816,7 @@ def _collect_sitemap_pages(
     robots_txt: Optional[str],
     *,
     max_sitemaps: int = 12,
+    url_limit: int = DEFAULT_MAX_SITEMAP_URLS,
 ) -> List[str]:
     targets: deque[str] = deque()
     seen_targets: Set[str] = set()
@@ -813,11 +836,14 @@ def _collect_sitemap_pages(
         xml_doc = _fetch_sitemap_document(target)
         if not xml_doc:
             continue
-        pages, nested = _parse_sitemap_document(xml_doc, base_host)
+        remaining = url_limit - len(collected_pages)
+        if remaining <= 0:
+            return collected_pages
+        pages, nested = _parse_sitemap_document(xml_doc, base_host, remaining)
         for page in pages:
             if page not in collected_pages:
                 collected_pages.append(page)
-                if len(collected_pages) >= MAX_SITEMAP_URLS:
+                if len(collected_pages) >= url_limit:
                     return collected_pages
         for nested_url in nested:
             if nested_url not in seen_targets:
@@ -832,6 +858,8 @@ def _build_seed_urls(
     base_host: Optional[str],
     robots_txt: Optional[str],
     sitemap_pages: List[str],
+    *,
+    seed_limit: int = DEFAULT_MAX_SEED_URLS,
 ) -> List[str]:
     seeds: List[str] = [urljoin(base_root, path) for path in COMMON_CONTENT_PATHS]
     seeds.extend(urljoin(base_root, path) for path in COMMON_LOGIN_PATHS)
@@ -847,7 +875,7 @@ def _build_seed_urls(
             continue
         seen.add(normalized)
         unique.append(normalized)
-        if len(unique) >= MAX_SEED_URLS:
+        if len(unique) >= seed_limit:
             break
     return unique
 
@@ -954,20 +982,22 @@ def _crawl_site(
                     logger.error("Crawler worker failed for %s: %s", candidate, exc)
                     resp = None
 
-                visited.add(candidate)
                 if resp is None or budget_exhausted:
+                    visited.add(candidate)
                     continue
 
                 normalized_final = _normalize_url(resp.url)
                 if normalized_final in visited:
-                    visited.add(normalized_final)
+                    visited.add(candidate)
                     continue
                 if resp.status_code >= 500 or not _is_html_response(resp):
+                    visited.add(candidate)
                     visited.add(normalized_final)
                     continue
 
                 snapshot = _snapshot_from_response(resp)
                 snapshots.append(snapshot)
+                visited.add(candidate)
                 visited.add(normalized_final)
                 _notify_progress(
                     progress_callback,
@@ -3828,8 +3858,16 @@ def run_scan(
     robots_resp = _safe_request(urljoin(base, "/robots.txt"), timeout=6)
     robots_txt = robots_resp.text if robots_resp and robots_resp.status_code == 200 else None
 
-    sitemap_pages = _collect_sitemap_pages(base, parsed_response.hostname, robots_txt)
+    max_pages, max_depth = _get_scan_limits(max_pages_override)
+    sitemap_limit = _resolve_sitemap_limit(max_pages)
+    sitemap_pages = _collect_sitemap_pages(
+        base,
+        parsed_response.hostname,
+        robots_txt,
+        url_limit=sitemap_limit,
+    )
     sitemap_found = bool(sitemap_pages)
+    seed_limit = _resolve_seed_limit(max_pages)
 
     initial_page = PageSnapshot(
         url=resp.url,
@@ -3838,8 +3876,13 @@ def run_scan(
         soup=soup,
         headers={k: v for k, v in resp.headers.items()},
     )
-    seed_urls = _build_seed_urls(base, parsed_response.hostname, robots_txt, sitemap_pages)
-    max_pages, max_depth = _get_scan_limits(max_pages_override)
+    seed_urls = _build_seed_urls(
+        base,
+        parsed_response.hostname,
+        robots_txt,
+        sitemap_pages,
+        seed_limit=seed_limit,
+    )
     _notify_progress(
         progress_callback,
         {"type": "phase", "phase": "crawl", "progress": 18},
@@ -3924,6 +3967,9 @@ def run_scan(
             "login_like_pages": login_like_pages[:10],
             "max_pages_budget": max_pages,
             "max_depth_budget": max_depth,
+             "crawl_budget_hit": len(crawled_pages) >= max_pages,
+             "seed_limit": seed_limit,
+             "sitemap_url_limit": sitemap_limit,
             "seed_urls": seed_urls[:10],
             "auth_mode": AUTH_CONTEXT,
             "checks": {

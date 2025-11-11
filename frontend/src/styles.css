@@ -149,6 +149,17 @@ body {
   font-weight: 600;
 }
 
+.info-message {
+  margin-top: 1rem;
+  background: #eff6ff;
+  border-left: 3px solid #3b82f6;
+  border-radius: 0.75rem;
+  padding: 0.9rem 1rem;
+  color: #0f172a;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
 .meta-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
