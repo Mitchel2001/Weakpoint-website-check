@@ -107,6 +107,10 @@ Voorbeeld responsefragment:
 - Produceert geen brute-force verkeer en gebruikt standaard timeouts/headers van de passieve scanner.
 - De payload en doel-URL's van de actieve requests worden in de `details`-sectie gelogd zodat je het gedrag kunt reproduceren.
 
+### OWASP Top 10 quickscan
+
+Naast de formuliertests draait de backend een lichte OWASP Top 10-quickscan: hij test standaardaccounts op `/login`, zoekt naar admin-termen in titel/links, inspecteert TLS + HSTS, stuurt veilige `search`-injecties (`' OR 1=1 --`, `<script>alert('XSS')</script>`), controleert security-headers/stack-informatie, analyseert loginformulieren, zoekt naar inline code/secrets en markeert SSRF-gevoelige parameters. Alles verschijnt in de **Actieve pentest**-kaart met bewijs per item. Beschouw dit als snelle voorselectie; voer voor diepgaand onderzoek alsnog een volledige pentest uit.
+
 ### Headless fallback (optioneel)
 
 Sommige sites blokkeren standaard HTTP-clients met JavaScript- of WAF-checks. Voor je **eigen** domeinen kun je een headless browser laten meedraaien zodat de scanner dezelfde pagina HTML ontvangt als een echte bezoeker:
@@ -127,7 +131,7 @@ Met `docker compose` gebeurt dit automatisch: het backend-image installeert Play
 ```powershell
 cd frontend
 npm install
-npm run dev             # start Vite op http://localhost:5173 (proxy naar http://localhost:8000)
+npm run dev             # start Vite op http://localhost:4173 (proxy naar http://localhost:8000)
 ```
 
 

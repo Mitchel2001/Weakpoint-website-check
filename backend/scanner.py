@@ -97,6 +97,27 @@ PENTEST_PAYLOADS = [
     },
 ]
 
+DEFAULT_PENTEST_ACCOUNTS = ("admin", "user", "guest")
+SENSITIVE_CONTENT_KEYWORDS = ("password", "wachtwoord", "passphrase")
+SENSITIVE_URL_KEYWORDS = ("password", "secret", "token", "credential")
+ADMIN_TITLE_KEYWORDS = ("admin", "beheer", "dashboard")
+SOURCE_LEAK_MARKERS = ("<?php", "begin rsa private key", "aws_secret_access_key", "api_key")
+STACK_TRACE_MARKERS = (
+    "traceback",
+    "stack trace",
+    "exception in thread",
+    "fatal error",
+    "undefined index",
+)
+SSRF_PARAM_HINTS = ("url", "target", "dest", "redirect", "callback", "feed", "next", "data", "resource")
+OUTDATED_COMPONENT_BASELINES: Dict[str, Tuple[int, ...]] = {
+    "php": (8, 1, 0),
+    "wordpress": (6, 0, 0),
+    "drupal": (10, 0, 0),
+    "joomla": (5, 0, 0),
+}
+VERSION_PATTERN = re.compile(r"(\d+(?:\.\d+)+)")
+
 CSRF_FIELD_HINTS = ("csrf", "xsrf", "token", "authenticity", "verification")
 
 try:
@@ -138,6 +159,11 @@ SECURITY_HEADERS = [
     "referrer-policy",
     "permissions-policy",
     "x-xss-protection",
+]
+
+OWASP_HEADER_BASELINE = SECURITY_HEADERS + [
+    "x-content-security-policy",
+    "feature-policy",
 ]
 
 LEGACY_TLS_PROTOCOLS: List[Tuple[str, Optional[int]]] = [
@@ -2521,6 +2547,540 @@ def _check_active_form_attacks(context: ScanContext) -> CheckResult:
     )
 
 
+def _parse_version_tuple(text: str) -> Optional[Tuple[int, ...]]:
+    if not text:
+        return None
+    match = VERSION_PATTERN.search(text)
+    if not match:
+        return None
+    try:
+        return tuple(int(part) for part in match.group(1).split("."))
+    except ValueError:
+        return None
+
+
+def _is_version_less(found: Tuple[int, ...], baseline: Tuple[int, ...]) -> bool:
+    max_len = max(len(found), len(baseline))
+    padded_found = tuple(list(found) + [0] * (max_len - len(found)))
+    padded_baseline = tuple(list(baseline) + [0] * (max_len - len(baseline)))
+    return padded_found < padded_baseline
+
+
+def _check_owasp_top10_quickscan(context: ScanContext) -> CheckResult:
+    parsed_root = context.parsed_url
+    origin = f"{parsed_root.scheme}://{parsed_root.netloc}" if parsed_root.netloc else context.target_url
+    extra_requests = 0
+    normalized_headers = {k.lower(): v for k, v in context.response.headers.items()}
+    server_header = normalized_headers.get("server", "")
+    powered_header = normalized_headers.get("x-powered-by", "")
+
+    def tracked_request(url: str, **kwargs):
+        nonlocal extra_requests
+        extra_requests += 1
+        return _safe_request(url, **kwargs)
+
+    categories: List[Dict[str, Any]] = []
+
+    def add_category(
+        category_id: str,
+        title: str,
+        status: str,
+        summary: str,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        categories.append(
+            {
+                "id": category_id,
+                "title": title,
+                "status": status,
+                "summary": summary,
+                "evidence": evidence or {},
+            }
+        )
+
+    component_findings: List[Dict[str, Any]] = []
+
+    def record_component(keyword: str, source: str, text: str) -> None:
+        if not text:
+            return
+        lowered = text.lower()
+        key = keyword.lower()
+        if key not in lowered:
+            return
+        pattern = re.compile(rf"{re.escape(keyword)}[\\s/:_-]*([0-9]+(?:\\.[0-9]+)*)", re.I)
+        match = pattern.search(text)
+        version_text = match.group(1) if match else None
+        version_tuple = _parse_version_tuple(version_text or "")
+        baseline = OUTDATED_COMPONENT_BASELINES.get(key)
+        outdated = bool(
+            version_tuple and baseline and _is_version_less(version_tuple, baseline)
+        )
+        component_findings.append(
+            {
+                "component": key,
+                "source": source,
+                "evidence": match.group(0) if match else keyword,
+                "version": version_text,
+                "baseline": ".".join(str(part) for part in baseline) if baseline else None,
+                "outdated": outdated,
+            }
+        )
+
+    for keyword in ("php", "apache", "nginx"):
+        record_component(keyword, "server", server_header)
+    if powered_header:
+        for keyword in ("php", "asp.net", "express"):
+            record_component(keyword, "x-powered-by", powered_header)
+
+    generator_entries: List[str] = []
+    if context.soup:
+        for meta in context.soup.find_all("meta"):
+            if (meta.get("name") or "").lower() != "generator":
+                continue
+            content = meta.get("content") or ""
+            if not content:
+                continue
+            generator_entries.append(content)
+            for keyword in ("wordpress", "drupal", "joomla"):
+                record_component(keyword, "meta:generator", content)
+
+    # A01: Broken Access Control
+    default_account_hits: List[Dict[str, Any]] = []
+    login_probe_url = urljoin(origin, "/login")
+    if parsed_root.scheme in {"http", "https"} and parsed_root.netloc:
+        for username in DEFAULT_PENTEST_ACCOUNTS:
+            resp = tracked_request(
+                login_probe_url,
+                params={"username": username, "password": "password"},
+                timeout=DEFAULT_TIMEOUT,
+            )
+            if resp is None:
+                continue
+            lowered = (resp.text or "").lower() if resp.text else ""
+            if resp.status_code == 200 and not any(
+                hint in lowered for hint in ("invalid", "error", "failed")
+            ):
+                default_account_hits.append(
+                    {
+                        "username": username,
+                        "status_code": resp.status_code,
+                        "url": resp.url,
+                    }
+                )
+    sensitive_data_links: List[Dict[str, Any]] = []
+    admin_links: List[str] = []
+    title_flags: List[str] = []
+    seen_links: Set[str] = set()
+    if context.soup:
+        page_title = context.soup.title.get_text(strip=True) if context.soup.title else ""
+        lowered_title = page_title.lower()
+        for keyword in ADMIN_TITLE_KEYWORDS:
+            if keyword in lowered_title:
+                title_flags.append(keyword)
+        for anchor in context.soup.find_all("a", href=True):
+            if len(seen_links) >= 10 or len(sensitive_data_links) >= 5:
+                break
+            href = anchor["href"].strip()
+            if not href or href.startswith("#") or href.lower().startswith(("mailto:", "javascript:")):
+                continue
+            full_url = urljoin(context.response.url, href)
+            parsed = urlparse(full_url)
+            if parsed.netloc and parsed_root.netloc and parsed.netloc != parsed_root.netloc:
+                continue
+            normalized = _normalize_url(full_url)
+            href_lower = normalized.lower()
+            if "admin" in href_lower:
+                if normalized not in admin_links:
+                    admin_links.append(normalized)
+            if normalized in seen_links:
+                continue
+            seen_links.add(normalized)
+            resp = tracked_request(full_url, timeout=DEFAULT_TIMEOUT)
+            if not resp or resp.status_code >= 400:
+                continue
+            text_lower = (resp.text or "").lower()
+            if any(keyword in text_lower for keyword in SENSITIVE_CONTENT_KEYWORDS):
+                sensitive_data_links.append(
+                    {"url": full_url, "status_code": resp.status_code}
+                )
+    if default_account_hits or admin_links:
+        a01_status = STATUS_FAIL
+        fail_parts = []
+        if default_account_hits:
+            fail_parts.append(f"default account probes ({len(default_account_hits)})")
+        if admin_links:
+            fail_parts.append(f"publieke admin-links ({len(admin_links)})")
+        a01_summary = " en ".join(fail_parts)
+    elif sensitive_data_links or title_flags:
+        a01_status = STATUS_WARN
+        warn_parts = []
+        if sensitive_data_links:
+            warn_parts.append(f"{len(sensitive_data_links)} link(s) met wachtwoordwoorden")
+        if title_flags:
+            warn_parts.append("titel bevat admin-termen")
+        a01_summary = "; ".join(warn_parts)
+    else:
+        a01_status = STATUS_PASS
+        a01_summary = "Geen aanwijzingen voor standaardaccounts of gelekte wachtwoorden op hoofdlinks."
+    add_category(
+        "A01",
+        "Broken Access Control",
+        a01_status,
+        a01_summary,
+        {
+            "default_account_responses": default_account_hits[:5],
+            "sensitive_links": sensitive_data_links[:5],
+            "probe_url": login_probe_url,
+            "admin_links": admin_links[:5],
+            "title_flags": title_flags,
+        },
+    )
+
+    # A02: Cryptographic Failures
+    tls_messages: List[str] = []
+    hsts_missing = False
+    if parsed_root.scheme != "https":
+        tls_messages.append("Doel gebruikt geen HTTPS (HTTP).")
+    else:
+        hostname = parsed_root.hostname
+        port = parsed_root.port or 443
+        if hostname:
+            try:
+                context_ssl = ssl.create_default_context()
+                with context_ssl.wrap_socket(
+                    socket.socket(socket.AF_INET),
+                    server_hostname=hostname,
+                ) as tls_socket:
+                    tls_socket.settimeout(5)
+                    tls_socket.connect((hostname, port))
+            except (ssl.SSLError, OSError) as exc:
+                tls_messages.append(f"TLS-handshake mislukt: {exc}")
+        else:
+            tls_messages.append("Kon hostnaam niet bepalen voor TLS-check.")
+        if "strict-transport-security" not in normalized_headers:
+            hsts_missing = True
+    if tls_messages:
+        a02_status = STATUS_FAIL
+        a02_summary = "; ".join(tls_messages)
+    elif hsts_missing:
+        a02_status = STATUS_WARN
+        a02_summary = "HTTPS actief maar HSTS-header ontbreekt op root."
+    else:
+        a02_status = STATUS_PASS
+        a02_summary = "HTTPS-verbinding accepteert standaard TLS-handshake."
+    add_category(
+        "A02",
+        "Cryptographic Failures",
+        a02_status,
+        a02_summary,
+        {
+            "issues": tls_messages,
+            "hsts_missing": hsts_missing,
+            "server_header": server_header,
+        },
+    )
+
+    # A03: Injection
+    sql_payload = "' OR 1=1 --"
+    xss_payload = "<script>alert('XSS')</script>"
+    sql_issue: Optional[Dict[str, Any]] = None
+    xss_issue: Optional[Dict[str, Any]] = None
+    search_url = urljoin(origin, "/search")
+
+    sql_resp = tracked_request(search_url, params={"q": sql_payload}, timeout=DEFAULT_TIMEOUT)
+    if sql_resp:
+        lowered = (sql_resp.text or "").lower()
+        if sql_resp.status_code >= 500 or "results" in lowered:
+            sql_issue = {
+                "status_code": sql_resp.status_code,
+                "url": sql_resp.url,
+            }
+
+    xss_resp = tracked_request(search_url, params={"q": xss_payload}, timeout=DEFAULT_TIMEOUT)
+    if xss_resp:
+        lowered = (xss_resp.text or "").lower()
+        if "alert" in lowered or "<script>alert('xss')</script>" in lowered:
+            xss_issue = {
+                "status_code": xss_resp.status_code,
+                "url": xss_resp.url,
+            }
+
+    if sql_issue:
+        a03_status = STATUS_FAIL
+        a03_summary = "SQL-payload veroorzaakt zichtbare fout of succes."
+    elif xss_issue:
+        a03_status = STATUS_WARN
+        a03_summary = "XSS-payload reflecteerde in zoekresultaten."
+    else:
+        a03_status = STATUS_PASS
+        a03_summary = "Zoek-endpoint reageerde niet gevoelig op standaard payloads."
+    add_category(
+        "A03",
+        "Injection",
+        a03_status,
+        a03_summary,
+        {
+            "sql_probe": sql_issue,
+            "xss_probe": xss_issue,
+            "tested_endpoint": search_url,
+        },
+    )
+
+    # A04: Insecure Design
+    insecure_links: List[str] = []
+    design_flags: List[str] = []
+    if server_header and "php" in server_header.lower():
+        design_flags.append("Server-header onthult PHP-stack.")
+    if context.soup:
+        for anchor in context.soup.find_all("a", href=True):
+            if len(insecure_links) >= 5:
+                break
+            href = anchor["href"].strip()
+            if not href:
+                continue
+            full_url = urljoin(context.response.url, href)
+            if any(keyword in full_url.lower() for keyword in SENSITIVE_URL_KEYWORDS):
+                insecure_links.append(full_url)
+    if insecure_links or design_flags:
+        a04_status = STATUS_WARN
+        summary_bits = []
+        if insecure_links:
+            summary_bits.append(f"URLs met gevoelige sleutelwoorden ({len(insecure_links)}x)")
+        if design_flags:
+            summary_bits.extend(design_flags)
+        a04_summary = "; ".join(summary_bits)
+    else:
+        a04_status = STATUS_PASS
+        a04_summary = "Geen gevoelige sleutelwoorden aangetroffen in URL-paden."
+    add_category(
+        "A04",
+        "Insecure Design",
+        a04_status,
+        a04_summary,
+        {"urls": insecure_links, "design_flags": design_flags},
+    )
+
+    # A05: Security Misconfiguration
+    headers = {k.lower(): v for k, v in context.response.headers.items()}
+    missing_headers = [header for header in OWASP_HEADER_BASELINE if header not in headers]
+    if missing_headers:
+        if len(missing_headers) >= 4:
+            a05_status = STATUS_FAIL
+        else:
+            a05_status = STATUS_WARN
+        a05_summary = f"Ontbrekende security-headers: {', '.join(missing_headers)}."
+    else:
+        a05_status = STATUS_PASS
+        a05_summary = "Belangrijkste security-headers aanwezig op hoofdpagina."
+    add_category(
+        "A05",
+        "Security Misconfiguration",
+        a05_status,
+        a05_summary,
+        {"missing_headers": missing_headers},
+    )
+
+    # A06: Vulnerable & Outdated Components
+    outdated_components = [entry for entry in component_findings if entry["outdated"]]
+    if outdated_components:
+        a06_status = STATUS_FAIL
+        a06_summary = f"Verouderde componenten: {', '.join(sorted({entry['component'] for entry in outdated_components}))}."
+    elif component_findings:
+        a06_status = STATUS_WARN
+        a06_summary = "Server onthult componentversies; controleer patchniveau."
+    else:
+        a06_status = STATUS_PASS
+        a06_summary = "Geen componentversies blootgelegd op basis van headers/meta."
+    add_category(
+        "A06",
+        "Vulnerable & Outdated Components",
+        a06_status,
+        a06_summary,
+        {"components": component_findings, "generator_meta": generator_entries[:3]},
+    )
+
+    # A07: Identification & Authentication Failures
+    weak_login_forms: List[Dict[str, Any]] = []
+    login_text_present = False
+    mfa_mentioned = False
+    if context.soup:
+        text_blob = context.soup.get_text(" ", strip=True).lower()
+        login_text_present = any(term in text_blob for term in ("login", "signin", "aanmelden"))
+        mfa_mentioned = any(term in text_blob for term in ("mfa", "2fa", "twee-factor"))
+        for form in context.soup.find_all("form"):
+            password_inputs = [
+                field
+                for field in form.find_all("input")
+                if (field.get("type") or "").lower() == "password"
+            ]
+            if not password_inputs:
+                continue
+            form_issues: List[str] = []
+            method = (form.get("method") or "get").lower()
+            if method != "post":
+                form_issues.append("method_is_get")
+            if not _form_has_csrf_token(form):
+                form_issues.append("missing_csrf")
+            if any(
+                (field.get("autocomplete") or "").lower() not in {"current-password", "new-password"}
+                for field in password_inputs
+            ):
+                form_issues.append("password_autocomplete")
+            if form_issues:
+                weak_login_forms.append(
+                    {
+                        "action": urljoin(context.response.url, form.get("action") or context.response.url),
+                        "method": method,
+                        "issues": form_issues,
+                    }
+                )
+    if any("method_is_get" in form["issues"] for form in weak_login_forms):
+        a07_status = STATUS_FAIL
+        a07_summary = "Loginformulier gebruikt GET of mist basale auth-verdediging."
+    elif weak_login_forms:
+        a07_status = STATUS_WARN
+        a07_summary = f"{len(weak_login_forms)} loginformulier(en) missen CSRF of veilige autocomplete."
+    elif login_text_present and not mfa_mentioned:
+        a07_status = STATUS_WARN
+        a07_summary = "Login vermeld zonder zichtbare verwijzing naar MFA."
+    else:
+        a07_status = STATUS_PASS
+        a07_summary = "Geen aanwijzingen voor zwakke authenticatie op de hoofdpagina."
+    add_category(
+        "A07",
+        "Identification & Authentication Failures",
+        a07_status,
+        a07_summary,
+        {
+            "weak_forms": weak_login_forms[:5],
+            "login_text_present": login_text_present,
+            "mfa_mentioned": mfa_mentioned,
+        },
+    )
+
+    # A08: Software & Data Integrity Failures
+    html_lower = (context.html or "").lower()
+    source_code_hits = [marker for marker in SOURCE_LEAK_MARKERS if marker in html_lower]
+    high_risk_markers = {"begin rsa private key", "aws_secret_access_key"}
+    if any(marker in high_risk_markers for marker in source_code_hits):
+        a08_status = STATUS_FAIL
+        a08_summary = "Broncode of sleutels in HTML-body aangetroffen."
+    elif source_code_hits:
+        a08_status = STATUS_WARN
+        a08_summary = "Inline codefragmenten gedetecteerd; controleer deployment-integriteit."
+    else:
+        a08_status = STATUS_PASS
+        a08_summary = "Geen codefragmenten of secrets aangetroffen in HTML."
+    add_category(
+        "A08",
+        "Software & Data Integrity Failures",
+        a08_status,
+        a08_summary,
+        {"markers": source_code_hits},
+    )
+
+    # A09: Security Logging & Monitoring Failures
+    stack_trace_hits = [marker for marker in STACK_TRACE_MARKERS if marker in html_lower]
+    if stack_trace_hits:
+        a09_status = STATUS_WARN
+        a09_summary = "Response bevat stacktrace/debug-informatie."
+    else:
+        a09_status = STATUS_PASS
+        a09_summary = "Geen debug stacktraces aangetroffen."
+    add_category(
+        "A09",
+        "Security Logging & Monitoring Failures",
+        a09_status,
+        a09_summary,
+        {"markers": stack_trace_hits},
+    )
+
+    # A10: SSRF & overige server-side issues
+    ssrf_vectors: List[Dict[str, Any]] = []
+    if context.soup:
+        for anchor in context.soup.find_all("a", href=True):
+            if len(ssrf_vectors) >= 5:
+                break
+            full_url = urljoin(context.response.url, anchor["href"])
+            parsed = urlparse(full_url)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+                if key.lower() in SSRF_PARAM_HINTS:
+                    ssrf_vectors.append(
+                        {
+                            "url": full_url,
+                            "param": key,
+                            "value_hint": value[:60],
+                        }
+                    )
+                    break
+        for form in context.soup.find_all("form"):
+            if len(ssrf_vectors) >= 5:
+                break
+            for input_tag in form.find_all("input"):
+                name = (input_tag.get("name") or "").lower()
+                if name in SSRF_PARAM_HINTS:
+                    ssrf_vectors.append(
+                        {
+                            "form_action": urljoin(context.response.url, form.get("action") or context.response.url),
+                            "param": name,
+                            "type": "form",
+                        }
+                    )
+                    break
+    if ssrf_vectors:
+        a10_status = STATUS_WARN
+        a10_summary = "Parameters aangetroffen die externe URL's accepteren; controleer SSRF-hardening."
+    else:
+        a10_status = STATUS_PASS
+        a10_summary = "Geen directe SSRF-indicatoren op hoofdpagina."
+    add_category(
+        "A10",
+        "SSRF & Server-side Issues",
+        a10_status,
+        a10_summary,
+        {"vectors": ssrf_vectors},
+    )
+
+    status_rank = {
+        STATUS_FAIL: 3,
+        STATUS_WARN: 2,
+        STATUS_INFO: 1,
+        STATUS_PASS: 0,
+    }
+    overall_status = STATUS_PASS
+    for cat in categories:
+        if status_rank[cat["status"]] > status_rank[overall_status]:
+            overall_status = cat["status"]
+    fail_ids = [cat["id"] for cat in categories if cat["status"] == STATUS_FAIL]
+    warn_ids = [cat["id"] for cat in categories if cat["status"] == STATUS_WARN]
+    if fail_ids:
+        summary = f"Problemen in {', '.join(fail_ids)} tijdens OWASP quickscan."
+    elif warn_ids:
+        summary = f"Waarschuwingen in {', '.join(warn_ids)} tijdens OWASP quickscan."
+    else:
+        summary = "OWASP quickscan vond geen kritieke afwijkingen."
+
+    remediation = "Los de genoemde OWASP-categorieën op: versterk toegangscontrole, beveilig TLS en valideer invoer."
+    impact = "Gebreken in deze top 10 verhogen de kans op privilege-escalatie, datalekken en misbruik van serverresources."
+
+    details = {
+        "owasp_top10": categories,
+        "extra_requests": extra_requests,
+        "login_probe_url": login_probe_url,
+    }
+
+    return _build_result(
+        id="owasp_top10_quickscan",
+        title="OWASP Top 10 quickscan",
+        severity=SEVERITY_CRITICAL,
+        status=overall_status,
+        summary=summary,
+        remediation=remediation,
+        impact=impact,
+        details=details,
+    )
+
+
 def _check_auth_session(context: ScanContext) -> CheckResult:
     pages = _iter_pages(context)
     issues: List[str] = []
@@ -3823,6 +4383,7 @@ CHECK_REGISTRY.register_many(
 )
 
 CHECK_REGISTRY.register("pentest", _check_active_form_attacks)
+CHECK_REGISTRY.register("pentest", _check_owasp_top10_quickscan)
 
 CHECK_REGISTRY.register_many(
     "nice_to_have",
